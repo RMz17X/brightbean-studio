@@ -50,6 +50,11 @@ urlpatterns = [
         name="reconnect",
     ),
     path(
+        "<uuid:workspace_id>/<uuid:account_id>/update-profile/",
+        views.update_profile,
+        name="update_profile",
+    ),
+    path(
         "<uuid:workspace_id>/<uuid:account_id>/retry-webhooks/",
         views.retry_webhooks,
         name="retry_webhooks",

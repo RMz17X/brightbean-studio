@@ -21,6 +21,7 @@ from apps.api.auth import ApiKeyAuth, McpAuth
 from apps.api.routers.accounts import router as accounts_router
 from apps.api.routers.analytics import router as analytics_router
 from apps.api.routers.inbox import router as inbox_router
+from apps.api.routers.live import router as live_router
 from apps.api.routers.me import router as me_router
 from apps.api.routers.media import router as media_router
 from apps.api.routers.posts import router as posts_router
@@ -81,7 +82,25 @@ api = NinjaAPI(
         "**Deleting posts.** Posts cannot be deleted via the API in v1. "
         "Cancel a scheduled post with `POST /posts/{id}/cancel`; remove "
         "drafts from the workspace's drafts list in the web UI. Published "
-        "posts are never deletable — they remain as audit records."
+        "posts are never deletable — they remain as audit records.\n\n"
+        "**YouTube Live.** `POST /live/` creates a broadcast plus its RTMP "
+        "ingest stream and returns the full stream key exactly once — copy "
+        "it into OBS immediately; list/detail never return it again. "
+        "`POST /live/{id}/transition` moves a broadcast to testing, live, "
+        "or complete; going live on a PUBLIC broadcast requires "
+        "`{\"confirm\": true}`. Live needs the full `youtube` OAuth scope on "
+        "the target account — an upload-only grant answers 403 until the "
+        "account is reconnected for Live from the web monitor.\n\n"
+        "**Account profiles.** `PATCH /accounts/{id}/profile` updates the "
+        "account's public profile on its destination platform: a direct "
+        "YouTube account takes `description` (max 1000 characters); a "
+        "direct Facebook Page takes `about` / `description` / `website` / "
+        "`phone` (no name — the Graph API cannot rename a Page). A YouTube "
+        "account connected via Zernio cannot update its description "
+        "(Zernio has no such endpoint) and answers 422; TikTok and "
+        "Instagram bios can only be changed in their apps and answer 422. "
+        "A YouTube token without the full scope answers 403 — reconnect "
+        "the account for Live from the web monitor."
     ),
     auth=ApiKeyAuth(),
     docs=NoncedSwagger(),
@@ -98,6 +117,7 @@ api.add_router("/posts", posts_router)
 api.add_router("/media", media_router)
 api.add_router("/analytics", analytics_router)
 api.add_router("/inbox", inbox_router)
+api.add_router("/live", live_router)
 # MCP Streamable HTTP transport. Same audit + rate limits as REST, but a
 # wider auth class: ``McpAuth`` accepts both bb_studio_ keys AND OAuth 2.1
 # access tokens (Claude Desktop's native connector flow). Mounted last so
@@ -267,9 +287,22 @@ def _action_for_path(method: str, path: str, *, status_code: int) -> str:
                 return f"inbox.reply.discard.{status_code}"
         if method == "GET":
             return f"inbox.read.{status_code}"
+    if "/live" in path:
+        if path.endswith("/transition"):
+            return f"live.transition.{status_code}"
+        if path.endswith("/recreate-stream"):
+            return f"live.recreate_stream.{status_code}"
+        if method == "POST":
+            return f"live.create.{status_code}"
+        if method == "DELETE":
+            return f"live.delete.{status_code}"
+        if method == "GET":
+            return f"live.read.{status_code}"
     if "/mcp" in path:
         return f"mcp.error.{status_code}"
     if "/accounts" in path:
+        if path.endswith("/profile"):
+            return f"accounts.update_profile.{status_code}"
         return f"accounts.list.{status_code}"
     if "/me" in path:
         return f"me.read.{status_code}"

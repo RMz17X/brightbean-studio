@@ -171,7 +171,7 @@ class SocialAccount(models.Model):
         unique_together = [("workspace", "platform", "account_platform_id")]
 
     def __str__(self):
-        return f"{self.account_name} ({self.get_platform_display()})"
+        return f"{self.account_name} ({self.display_platform_label})"
 
     def save(self, *args, **kwargs):
         """Invalidate Instagram checks atomically when either credential changes."""
@@ -262,6 +262,46 @@ class SocialAccount(models.Model):
         ``ui_select`` tag's ``label_field``) still renders the same text.
         """
         return self.account_name or self.account_handle
+
+    @property
+    def is_via_zernio(self) -> bool:
+        """True when this account publishes through the Zernio transport."""
+        return self.platform == "zernio"
+
+    @property
+    def display_platform(self) -> str:
+        """Effective platform this account publishes to.
+
+        Zernio is a transport, not a platform: a Zernio-bound account
+        publishes to its binding's destination (YouTube, TikTok, ...),
+        and every platform rule — caption limits, media requirements,
+        field config — must see that destination. Routing still uses the
+        raw ``platform`` ("zernio"); see the publish engine. An unbound
+        Zernio row falls back to "zernio" so nothing crashes mid-flight.
+        """
+        if self.platform != "zernio":
+            return self.platform
+        try:
+            binding = getattr(self, "zernio_binding", None)
+        except (AttributeError, ValueError):
+            return self.platform
+        if binding is None:
+            return self.platform
+        return binding.destination_platform or self.platform
+
+    @property
+    def transport(self) -> str | None:
+        """Transport carrying this account's publishes ("zernio"), else None."""
+        return "zernio" if self.is_via_zernio else None
+
+    @property
+    def display_platform_label(self) -> str:
+        """Human label for :attr:`display_platform` ("TikTok", "YouTube")."""
+        if self.is_via_zernio:
+            from apps.zernio.models import DESTINATION_LABELS
+
+            return DESTINATION_LABELS.get(self.display_platform, self.display_platform)
+        return self.get_platform_display()
 
     def token_expires_within(self, window) -> bool:
         """Whether the recorded expiry falls inside ``window`` from now.
@@ -383,7 +423,16 @@ class SocialAccount(models.Model):
             raise
         return self.oauth_access_token
 
-    # Platform character limits
+    # Platform character limits.
+    #
+    # Fallback (deliberate, documented like the quota fallback in
+    # ``apps/api/limits.py``): a destination with no key here — today
+    # only Zernio-LinkedIn, whose destination slug is ``"linkedin"``
+    # while this map only carries ``"linkedin_personal"`` /
+    # ``"linkedin_company"`` — falls back to 2200 via ``char_limit``
+    # and to ``PLATFORM_FIELD_DEFAULTS`` via ``field_config``. No
+    # LinkedIn number is guessed here: the personal/company flavour
+    # of a ``"linkedin"`` destination is not known at this layer.
     PLATFORM_CHAR_LIMITS = {
         "facebook": 63206,
         "instagram": 2200,
@@ -402,14 +451,14 @@ class SocialAccount(models.Model):
 
     @property
     def char_limit(self) -> int:
-        return self.PLATFORM_CHAR_LIMITS.get(self.platform, 2200)
+        return self.PLATFORM_CHAR_LIMITS.get(self.display_platform, 2200)
 
     @property
     def escaped_chars(self) -> str:
         """Characters this platform escapes, each costing two against the limit."""
         from providers import CAPTION_ESCAPED_CHARS
 
-        return CAPTION_ESCAPED_CHARS.get(self.platform, "")
+        return CAPTION_ESCAPED_CHARS.get(self.display_platform, "")
 
     def caption_wire_length(self, text: str) -> int:
         """Caption length as this platform counts it, after any escaping.
@@ -419,7 +468,7 @@ class SocialAccount(models.Model):
         """
         from providers import caption_wire_length
 
-        return caption_wire_length(self.platform, text)
+        return caption_wire_length(self.display_platform, text)
 
     # Platform-specific field configuration (which platforms need extra fields)
     PLATFORM_FIELD_CONFIG: dict[str, dict[str, Any]] = {
@@ -465,10 +514,45 @@ class SocialAccount(models.Model):
         "advanced_fields": [],
     }
 
+    # Advanced fields Zernio's POST /v1/posts actually carries, by
+    # destination platform. Everything else in the direct providers'
+    # advanced lists has no Zernio padanan (YouTube thumbnail /
+    # made_for_kids, Pinterest board / link / alt text / cover, ...) and
+    # is dropped for via-Zernio accounts, so the composer never advertises
+    # an option the transport silently discards. TikTok's panel options
+    # (privacy, allow_*, is_aigc) are not advanced_fields; they are mapped
+    # in providers.zernio.build_post_payload instead.
+    ZERNIO_ADVANCED_FIELDS: dict[str, list[str]] = {
+        "youtube": ["privacy_status", "tags"],
+    }
+
     @property
     def field_config(self) -> dict:
-        """Return field configuration for this platform."""
-        return {**self.PLATFORM_FIELD_DEFAULTS, **self.PLATFORM_FIELD_CONFIG.get(self.platform, {})}
+        """Return field configuration for this platform.
+
+        Title/caption/first-comment requirements follow the destination
+        platform. For Zernio accounts ``advanced_fields`` keeps only the
+        destination extras Zernio's POST /v1/posts actually carries
+        (YouTube privacy_status/tags -> visibility/tags); the rest of the
+        direct providers' extras (thumbnail, made_for_kids, board, ...)
+        have no Zernio padanan and are dropped, so the composer never
+        advertises an option the transport silently discards.
+        ``supports_first_comment`` is likewise forced False for Zernio
+        accounts: the transport has no comment endpoint, so it cannot
+        honour a first comment even when the destination could.
+        """
+        cfg = {**self.PLATFORM_FIELD_DEFAULTS, **self.PLATFORM_FIELD_CONFIG.get(self.display_platform, {})}
+        if self.is_via_zernio:
+            allowed = self.ZERNIO_ADVANCED_FIELDS.get(self.display_platform, [])
+            cfg["advanced_fields"] = [f for f in cfg["advanced_fields"] if f in allowed]
+            # Zernio has no comment endpoint, so the transport cannot honour
+            # a first comment even when the destination platform could.
+            # Set here — the single source of truth — so every reader of
+            # field_config (API schema, composer, engine via
+            # supports_first_comment()) agrees instead of advertising a
+            # first comment that would hang PENDING forever.
+            cfg["supports_first_comment"] = False
+        return cfg
 
     @property
     def keeps_platform_grant_on_disconnect(self) -> bool:
@@ -533,6 +617,8 @@ class SocialAccount(models.Model):
         is the exception: in OIDC mode the socialActions.CREATE endpoint returns
         403 ACCESS_DENIED because that endpoint is gated on Community Management
         API approval. Resolve credentials and check ``_oauth_mode`` for it.
+        Zernio accounts always answer False: ``field_config`` forces the flag
+        off because the transport has no comment endpoint.
         """
         if not self.field_config.get("supports_first_comment", True):
             return False
@@ -562,7 +648,7 @@ class SocialAccount(models.Model):
             "mastodon": "ma",
             "devto": "dv",
         }
-        return icons.get(self.platform, self.platform[:2])
+        return icons.get(self.display_platform, self.display_platform[:2])
 
 
 class MastodonAppRegistration(models.Model):
@@ -579,6 +665,118 @@ class MastodonAppRegistration(models.Model):
 
     def __str__(self):
         return self.instance_url
+
+
+class LiveBroadcast(models.Model):
+    """A YouTube Live broadcast created from the Live monitor.
+
+    One row = one ``liveBroadcasts`` resource bound to one ``liveStreams``
+    ingest. The broadcast id IS the watch-URL video id. The RTMP stream
+    key is a credential: it lives in :class:`EncryptedTextField`, is never
+    written to logs, and the UI only ever shows it masked — except once,
+    on the page right after creation, and on explicit per-click reveal.
+    The ingest *address* (``rtmp://a.rtmp.youtube.com/live2``) is public
+    knowledge and is stored in plain text.
+    """
+
+    class Status(models.TextChoices):
+        READY = "ready", "Ready"
+        TESTING = "testing", "Testing"
+        LIVE = "live", "Live"
+        COMPLETE = "complete", "Complete"
+        CANCELLED = "cancelled", "Cancelled"
+        ERROR = "error", "Error"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workspace = models.ForeignKey(
+        "workspaces.Workspace",
+        on_delete=models.CASCADE,
+        related_name="live_broadcasts",
+    )
+    social_account = models.ForeignKey(
+        SocialAccount,
+        on_delete=models.CASCADE,
+        related_name="live_broadcasts",
+    )
+    broadcast_id = models.CharField(max_length=64, unique=True)
+    stream_id = models.CharField(max_length=64, blank=True, default="")
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True, default="")
+    privacy_status = models.CharField(max_length=10, default="private")
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.READY)
+    scheduled_start = models.DateTimeField(blank=True, null=True)
+    actual_start = models.DateTimeField(blank=True, null=True)
+    actual_end = models.DateTimeField(blank=True, null=True)
+    last_viewers = models.PositiveIntegerField(blank=True, null=True)
+    last_stream_status = models.CharField(max_length=20, blank=True, default="")
+    last_health_status = models.CharField(max_length=20, blank=True, default="")
+    stream_url = models.CharField(
+        max_length=500,
+        blank=True,
+        default="",
+        help_text="RTMP ingestion address (no key in it).",
+    )
+    stream_key = EncryptedTextField(blank=True, default="")
+    # True once the full key has been shown on the post-creation page.
+    # The monitor only ever shows the masked key after that; copying needs
+    # an explicit per-click reveal.
+    key_shown = models.BooleanField(default=False)
+    last_error = models.CharField(max_length=500, blank=True, default="")
+    last_checked_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = WorkspaceScopedManager()
+
+    class Meta:
+        db_table = "social_accounts_live_broadcast"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["workspace", "status"]),
+            models.Index(fields=["social_account", "-created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.title} ({self.broadcast_id})"
+
+    @property
+    def watch_url(self) -> str:
+        return f"https://www.youtube.com/watch?v={self.broadcast_id}"
+
+    @property
+    def masked_stream_key(self) -> str:
+        """Stream key with only the last 4 characters visible (for display)."""
+        from providers.youtube import mask_stream_key
+
+        return mask_stream_key(self.stream_key or "")
+
+    @property
+    def is_active(self) -> bool:
+        return self.status in (self.Status.TESTING, self.Status.LIVE)
+
+    @property
+    def is_actionable(self) -> bool:
+        """READY/TESTING/LIVE: shown on the monitor active card.
+
+        ``is_active`` deliberately stays TESTING/LIVE only - the ingest
+        is actually running / on air - because the API detail read, the
+        MCP list and the JSON poller use it to decide whether to spend a
+        YouTube status poll. A READY broadcast is not active in that
+        sense, but the operator can act on it from the monitor (Start
+        test, or Go Live directly without testing first), so the monitor
+        card must include it. Kept as a separate property so widening
+        the card does not silently change polling/quota behaviour
+        elsewhere. COMPLETE/CANCELLED/ERROR have no monitor actions.
+        """
+        return self.status in (self.Status.READY, self.Status.TESTING, self.Status.LIVE)
+
+    @property
+    def uptime(self):
+        """Seconds since the actual start, or None when not started."""
+        if not self.actual_start:
+            return None
+        end = self.actual_end or timezone.now()
+        return max(0, int((end - self.actual_start).total_seconds()))
 
 
 class PlatformVisibility(models.Model):

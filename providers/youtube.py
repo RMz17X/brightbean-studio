@@ -40,9 +40,21 @@ logger = logging.getLogger(__name__)
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 API_BASE = "https://www.googleapis.com/youtube/v3"
 UPLOAD_BASE = "https://www.googleapis.com/upload/youtube/v3"
 ANALYTICS_BASE = "https://youtubeanalytics.googleapis.com/v2"
+
+# Full YouTube scope. The Live Streaming API (liveBroadcasts /
+# liveStreams) accepts ONLY this scope — ``youtube.upload``,
+# ``youtube.readonly`` and ``youtube.force-ssl`` are all refused with
+# ``insufficientPermissions``. It is a restricted scope, so it is NOT in
+# the default list: ``include_live_scopes`` (see ``SocialProvider``)
+# flips it on for the Live re-authorize flow only. A token minted by the
+# regular upload-only connect does not carry it and cannot go live until
+# the channel owner reconnects with the Live flow; the Google consent
+# screen must list this scope too.
+LIVE_SCOPE = "https://www.googleapis.com/auth/youtube"
 
 # ``videos.insert``: both the resumable-session POST and the PUT that carries
 # the bytes, whose Location URL keeps this path and adds an ``upload_id``.
@@ -123,6 +135,201 @@ class YouTubeMessageBatch(list[InboxMessage]):
         self.next_page_token = next_page_token
 
 
+# ----------------------------------------------------------------------
+# YouTube Live helpers (pure: no HTTP, no provider instance).
+# ----------------------------------------------------------------------
+# Kept at module level so the monitor view can build the exact request
+# bodies for a dry-run, and so unit tests can pin the wire shape without
+# mocking the transport. The provider methods above are thin wrappers that
+# POST/GET these bodies and parse the responses with the functions below.
+
+_LIVE_LIFECYCLE_TO_STATUS = {
+    "created": "ready",
+    "ready": "ready",
+    "testStarting": "testing",
+    "testing": "testing",
+    "liveStarting": "live",
+    "live": "live",
+    "complete": "complete",
+    "revoked": "cancelled",
+}
+
+_LIVE_RESOLUTIONS = ("2160p", "1080p", "720p", "480p", "360p", "240p", "144p")
+_LIVE_FRAME_RATES = ("30fps", "60fps")
+
+
+def map_live_lifecycle(life_cycle_status: str | None) -> str:
+    """Map a YouTube ``lifeCycleStatus`` to a ``LiveBroadcast.status`` value."""
+    return _LIVE_LIFECYCLE_TO_STATUS.get(life_cycle_status or "", "error")
+
+
+def build_live_stream_body(title: str, *, resolution: str = "1080p", frame_rate: str = "30fps") -> dict:
+    """Request body for ``liveStreams.insert`` (RTMP ingest, active stream)."""
+    if resolution not in _LIVE_RESOLUTIONS:
+        raise ValueError(f"Unsupported live resolution: {resolution!r}")
+    if frame_rate not in _LIVE_FRAME_RATES:
+        raise ValueError(f"Unsupported live frame rate: {frame_rate!r}")
+    return {
+        "snippet": {"title": title},
+        "cdn": {"ingestionType": "rtmp", "resolution": resolution, "frameRate": frame_rate},
+        "contentDetails": {"isReusable": False},
+        "status": {"streamStatus": "active"},
+    }
+
+
+def build_live_broadcast_body(
+    title: str,
+    *,
+    description: str = "",
+    privacy_status: str = "private",
+    scheduled_start_time: str | None = None,
+) -> dict:
+    """Request body for ``liveBroadcasts.insert``."""
+    if privacy_status not in ("public", "unlisted", "private"):
+        raise ValueError(f"Unsupported live privacy status: {privacy_status!r}")
+    snippet: dict = {"title": title, "description": description}
+    if scheduled_start_time:
+        snippet["scheduledStartTime"] = scheduled_start_time
+    return {"snippet": snippet, "status": {"privacyStatus": privacy_status}}
+
+
+def rtmps_ingestion_url(ingestion_address: str) -> str:
+    """RTMPS (TLS, port 443) variant of an ``rtmp://`` ingestion address.
+
+    YouTube hands out the plain ``rtmp://a.rtmp.youtube.com/live2`` address;
+    the encrypted form is the same host on port 443 with the ``rtmps``
+    scheme. Anything already encrypted (or empty) passes through unchanged.
+    """
+    if not ingestion_address:
+        return ""
+    if ingestion_address.startswith("rtmps://"):
+        return ingestion_address
+    if ingestion_address.startswith("rtmp://"):
+        rest = ingestion_address[len("rtmp://"):]
+        host, _, path = rest.partition("/")
+        return f"rtmps://{host}:443/{path}" if path else f"rtmps://{host}:443"
+    return ingestion_address
+
+
+def mask_stream_key(stream_key: str) -> str:
+    """Mask a stream key for display: only the last 4 characters show.
+
+    Dashes are kept so the shape stays recognisable (``xxxx-xxxx-ab12``);
+    every other character becomes a bullet. Never log the unmasked key.
+    """
+    if not stream_key:
+        return ""
+    visible = 4
+    chars = list(stream_key)
+    shown = 0
+    for i in range(len(chars) - 1, -1, -1):
+        if chars[i] == "-":
+            continue
+        if shown < visible:
+            shown += 1
+        else:
+            chars[i] = "•"
+    return "".join(chars)
+
+
+def parse_live_broadcast(item: dict) -> dict:
+    """Flatten one ``liveBroadcasts`` resource into the monitor's shape."""
+    snippet = item.get("snippet", {}) or {}
+    status = item.get("status", {}) or {}
+    return {
+        "broadcast_id": item.get("id", ""),
+        "title": snippet.get("title", ""),
+        "description": snippet.get("description", ""),
+        "life_cycle_status": status.get("lifeCycleStatus", ""),
+        "status": map_live_lifecycle(status.get("lifeCycleStatus")),
+        "privacy_status": status.get("privacyStatus", ""),
+        "scheduled_start_time": snippet.get("scheduledStartTime"),
+        "actual_start_time": snippet.get("actualStartTime"),
+        "actual_end_time": snippet.get("actualEndTime"),
+    }
+
+
+def parse_live_stream(item: dict) -> dict:
+    """Flatten one ``liveStreams`` resource (ingest + health) into shape."""
+    snippet = item.get("snippet", {}) or {}
+    cdn = item.get("cdn", {}) or {}
+    ingestion = cdn.get("ingestionInfo", {}) or {}
+    status = item.get("status", {}) or {}
+    health = status.get("healthStatus", {}) or {}
+    return {
+        "stream_id": item.get("id", ""),
+        "title": snippet.get("title", ""),
+        "stream_status": status.get("streamStatus", ""),
+        "health_status": health.get("status", ""),
+        "ingestion_address": ingestion.get("ingestionAddress", ""),
+        "backup_ingestion_address": ingestion.get("backupIngestionAddress", ""),
+        "stream_name": ingestion.get("streamName", ""),
+    }
+
+
+def parse_live_video_details(item: dict) -> dict:
+    """Flatten one ``videos`` resource's live counters into shape."""
+    details = item.get("liveStreamingDetails", {}) or {}
+    stats = item.get("statistics", {}) or {}
+    viewers = details.get("concurrentViewers")
+    return {
+        "video_id": item.get("id", ""),
+        "concurrent_viewers": int(viewers) if viewers is not None else None,
+        "actual_start_time": details.get("actualStartTime"),
+        "actual_end_time": details.get("actualEndTime"),
+        "view_count": int(stats.get("viewCount", 0)) if stats.get("viewCount") is not None else None,
+    }
+
+
+# ----------------------------------------------------------------------
+# Channel description helpers (pure: no HTTP, no provider instance).
+# ----------------------------------------------------------------------
+# ``channels.update`` overwrites every property of each part in the body,
+# so the only safe way to change the description is to read the channel's
+# current ``brandingSettings`` first and write them back with just
+# ``brandingSettings.channel.description`` replaced. These helpers pin
+# that wire shape without mocking the transport, like the Live helpers
+# above; :meth:`YouTubeProvider.update_channel_description` is the thin
+# wrapper that performs the GET + PUT.
+
+# Longest description YouTube accepts for a channel (characters).
+MAX_CHANNEL_DESCRIPTION_LENGTH = 1000
+
+# 403 reasons that mean "this token does not carry the scope the call
+# needs" rather than a quota or auth failure. Google answers a
+# ``channels.update`` from an upload-only token with
+# ``insufficientPermissions``; ``forbidden`` is the same refusal under
+# its older spelling, and the analytics sync already treats it as an
+# insufficient-scope signal (see ``_is_insufficient_scope``).
+_INSUFFICIENT_SCOPE_REASONS = frozenset({"insufficientpermissions", "forbidden"})
+
+
+def build_channel_description_body(channel: dict, description: str) -> dict:
+    """Request body for ``channels.update`` that only changes the description.
+
+    Copies the channel's current ``brandingSettings`` back verbatim and
+    replaces only ``brandingSettings.channel.description`` — sending the
+    description alone would wipe the channel's other branding settings
+    (keywords, trailer, banner). The input is not mutated: both nested
+    mappings are copied before the description is replaced.
+    """
+    branding = dict(channel.get("brandingSettings") or {})
+    channel_settings = dict(branding.get("channel") or {})
+    channel_settings["description"] = description
+    branding["channel"] = channel_settings
+    return {"id": channel.get("id", ""), "brandingSettings": branding}
+
+
+def parse_channel_description(item: dict) -> dict:
+    """Flatten one ``channels`` resource into the update result shape."""
+    branding = item.get("brandingSettings", {}) or {}
+    channel_settings = branding.get("channel", {}) or {}
+    return {
+        "channel_id": item.get("id", ""),
+        "description": channel_settings.get("description", ""),
+    }
+
+
 class YouTubeProvider(SocialProvider):
     """YouTube Data API v3 provider using Google OAuth 2.0."""
 
@@ -151,6 +358,11 @@ class YouTubeProvider(SocialProvider):
         return [MediaType.MP4, MediaType.MOV]
 
     @property
+    def live_scopes(self) -> list[str]:
+        """Scopes the Live Streaming API needs (the full YouTube scope)."""
+        return [LIVE_SCOPE]
+
+    @property
     def required_scopes(self) -> list[str]:
         scopes = [
             "https://www.googleapis.com/auth/youtube.upload",
@@ -159,6 +371,8 @@ class YouTubeProvider(SocialProvider):
         ]
         if self.include_analytics_scopes:
             scopes.extend(self.analytics_only_scopes)
+        if self.include_live_scopes:
+            scopes.append(LIVE_SCOPE)
         return scopes
 
     @property
@@ -300,6 +514,95 @@ class YouTubeProvider(SocialProvider):
                 "video_count": int(stats.get("videoCount", 0)),
             },
         )
+
+    # ------------------------------------------------------------------
+    # Channel settings
+    # ------------------------------------------------------------------
+
+    def update_channel_description(
+        self,
+        access_token: str,
+        description: str,
+        *,
+        channel_id: str | None = None,
+    ) -> dict:
+        """Replace the channel description, keeping all other branding settings.
+
+        Reads the channel's current ``brandingSettings`` first
+        (``channels.list``), then writes them back with only
+        ``brandingSettings.channel.description`` changed
+        (``channels.update``) — the update overwrites every property of
+        the parts it carries, so sending the description alone would wipe
+        the rest of the channel's branding (keywords, trailer, banner).
+
+        ``description`` may be empty (clears the description) and is at
+        most 1000 characters; longer input is rejected with
+        :class:`ValueError` before any API call is made. Without
+        ``channel_id`` the authenticated channel (``mine=true``) is used,
+        like :meth:`get_profile`.
+
+        Needs the full ``https://www.googleapis.com/auth/youtube`` scope
+        (``LIVE_SCOPE``): a token minted by the regular upload-only
+        connect is refused with 403 ``insufficientPermissions``. That
+        refusal is re-raised as an :class:`APIError` that names the fix —
+        re-authorize with the full scope via the Reconnect for Live
+        button on the Live page — instead of the raw Google error. The
+        message keeps the "scope" marker so
+        ``apps.analytics.tasks._is_insufficient_scope`` still recognises
+        it as a reconnect signal, and the error is not retryable: no
+        retry will ever add a scope the token does not carry.
+
+        Returns ``{"channel_id": ..., "description": ...}`` from the
+        updated resource, parsed by :func:`parse_channel_description`.
+        """
+        if not isinstance(description, str):
+            raise ValueError("Channel description must be a string")
+        if len(description) > MAX_CHANNEL_DESCRIPTION_LENGTH:
+            raise ValueError(
+                f"Channel description is {len(description)} characters; "
+                f"YouTube allows at most {MAX_CHANNEL_DESCRIPTION_LENGTH}"
+            )
+        try:
+            params: dict = {"part": "brandingSettings"}
+            if channel_id:
+                params["id"] = channel_id
+            else:
+                params["mine"] = "true"
+            get_resp = self._request(
+                "GET",
+                f"{API_BASE}/channels",
+                access_token=access_token,
+                params=params,
+            )
+            items = get_resp.json().get("items", []) or []
+            if not items:
+                raise APIError(
+                    "YouTube returned no channel for this account; cannot update the channel description",
+                    status_code=404,
+                    platform=self.platform_name,
+                    retryable=False,
+                )
+            body = build_channel_description_body(items[0], description)
+            put_resp = self._request(
+                "PUT",
+                f"{API_BASE}/channels",
+                access_token=access_token,
+                params={"part": "brandingSettings"},
+                json=body,
+            )
+        except APIError as exc:
+            if exc.status_code == 403 and _INSUFFICIENT_SCOPE_REASONS & google_error_reasons(exc.raw_response or {}):
+                raise APIError(
+                    "YouTube menolak update deskripsi channel: token ini tidak punya "
+                    "scope penuh YouTube — butuh re-authorize dengan scope penuh "
+                    "(YouTube) — pakai tombol Reconnect for Live di halaman Live",
+                    status_code=403,
+                    platform=self.platform_name,
+                    raw_response=exc.raw_response,
+                    retryable=False,
+                ) from exc
+            raise
+        return parse_channel_description(put_resp.json())
 
     # ------------------------------------------------------------------
     # Publishing
@@ -1104,3 +1407,199 @@ class YouTubeProvider(SocialProvider):
         except Exception:
             logger.warning("YouTube revocation deferred; retry via encrypted outbox")
             return False
+
+    # ------------------------------------------------------------------
+    # YouTube Live (Live Streaming API)
+    # ------------------------------------------------------------------
+    # One broadcast = one ``liveBroadcasts`` resource (the video viewers
+    # see — its id IS the watch-URL video id) bound to one ``liveStreams``
+    # resource (the RTMP ingest: stream key + server URL). Creating them is
+    # two calls; going live is a transition on the broadcast. Live calls
+    # cost 1 quota unit each from the regular 10,000-unit Data API pool
+    # (Google quota calculator, 2026-10-15) — NOT the 100/day
+    # ``videos.insert`` bucket and NOT the Analytics pool. The monitor page
+    # therefore throttles its status polls server-side (see
+    # ``apps.social_accounts.live_views``).
+    #
+    # Auth: every method below needs the full ``youtube`` scope
+    # (``LIVE_SCOPE``). A token minted by the regular upload-only connect
+    # is refused with ``insufficientPermissions`` (an ``APIError`` — see
+    # ``_error_for_response``); the Live monitor turns that into a
+    # re-authorize prompt instead of a generic failure.
+
+    LIVE_RESOLUTIONS = _LIVE_RESOLUTIONS
+    LIVE_FRAME_RATES = _LIVE_FRAME_RATES
+    LIVE_TRANSITIONS = ("testing", "live", "complete")
+
+    def create_live_stream(
+        self,
+        access_token: str,
+        *,
+        title: str,
+        resolution: str = "1080p",
+        frame_rate: str = "30fps",
+    ) -> dict:
+        """Create a ``liveStreams`` ingest and return its parsed status.
+
+        The returned dict carries ``stream_name`` — the RTMP stream key —
+        and ``ingestion_address``. Callers must treat the key as a secret:
+        never log it, never put it in a URL, store it encrypted.
+        """
+        body = build_live_stream_body(title, resolution=resolution, frame_rate=frame_rate)
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/liveStreams",
+            access_token=access_token,
+            params={"part": "snippet,cdn,contentDetails,status"},
+            json=body,
+        )
+        return parse_live_stream(resp.json())
+
+    def create_live_broadcast(
+        self,
+        access_token: str,
+        *,
+        title: str,
+        description: str = "",
+        privacy_status: str = "private",
+        scheduled_start_time: str | None = None,
+    ) -> dict:
+        """Create a ``liveBroadcasts`` resource and return its parsed status."""
+        body = build_live_broadcast_body(
+            title,
+            description=description,
+            privacy_status=privacy_status,
+            scheduled_start_time=scheduled_start_time,
+        )
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/liveBroadcasts",
+            access_token=access_token,
+            params={"part": "snippet,status,contentDetails"},
+            json=body,
+        )
+        return parse_live_broadcast(resp.json())
+
+    def bind_live_broadcast(
+        self,
+        access_token: str,
+        *,
+        broadcast_id: str,
+        stream_id: str,
+    ) -> dict:
+        """Bind a broadcast to its ingest stream; returns the parsed broadcast."""
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/liveBroadcasts/bind",
+            access_token=access_token,
+            params={"part": "id,contentDetails,snippet,status", "id": broadcast_id, "streamId": stream_id},
+        )
+        return parse_live_broadcast(resp.json())
+
+    def transition_live_broadcast(
+        self,
+        access_token: str,
+        *,
+        broadcast_id: str,
+        broadcast_status: str,
+    ) -> dict:
+        """Move a broadcast to ``testing`` / ``live`` / ``complete``.
+
+        YouTube only accepts the transition when the ingest is in the
+        matching state (e.g. ``live`` needs an active stream), otherwise it
+        answers 403/400 — the caller surfaces that as-is.
+        """
+        if broadcast_status not in self.LIVE_TRANSITIONS:
+            raise ValueError(f"Unknown live transition: {broadcast_status!r}")
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/liveBroadcasts/transition",
+            access_token=access_token,
+            params={"part": "id,status,snippet", "broadcastStatus": broadcast_status, "id": broadcast_id},
+        )
+        return parse_live_broadcast(resp.json())
+
+    def get_live_broadcast(self, access_token: str, *, broadcast_id: str) -> dict:
+        """Fetch one broadcast's parsed status, or {} when YouTube omits it."""
+        resp = self._request(
+            "GET",
+            f"{API_BASE}/liveBroadcasts",
+            access_token=access_token,
+            params={"part": "id,snippet,status,contentDetails", "id": broadcast_id},
+        )
+        items = resp.json().get("items", []) or []
+        return parse_live_broadcast(items[0]) if items else {}
+
+    def get_live_stream(self, access_token: str, *, stream_id: str) -> dict:
+        """Fetch one ingest stream's parsed status, or {} when omitted."""
+        resp = self._request(
+            "GET",
+            f"{API_BASE}/liveStreams",
+            access_token=access_token,
+            params={"part": "id,snippet,cdn,status", "id": stream_id},
+        )
+        items = resp.json().get("items", []) or []
+        return parse_live_stream(items[0]) if items else {}
+
+    def get_live_video_details(self, access_token: str, *, video_id: str) -> dict:
+        """Live counters for a broadcast (its id is the video id).
+
+        Returns ``concurrent_viewers`` plus the actual start/end times, or
+        {} when the video is not (yet) a live one.
+        """
+        resp = self._request(
+            "GET",
+            f"{API_BASE}/videos",
+            access_token=access_token,
+            params={"part": "liveStreamingDetails,snippet,statistics", "id": video_id},
+        )
+        items = resp.json().get("items", []) or []
+        return parse_live_video_details(items[0]) if items else {}
+
+    def delete_live_broadcast(self, access_token: str, *, broadcast_id: str) -> bool:
+        """Delete a broadcast; False when YouTube refuses (already gone, ...)."""
+        try:
+            self._request(
+                "DELETE",
+                f"{API_BASE}/liveBroadcasts",
+                access_token=access_token,
+                params={"id": broadcast_id},
+            )
+            return True
+        except Exception:
+            logger.warning("Could not delete YouTube live broadcast %s", broadcast_id, exc_info=True)
+            return False
+
+    def delete_live_stream(self, access_token: str, *, stream_id: str) -> bool:
+        """Delete an ingest stream; False when YouTube refuses."""
+        try:
+            self._request(
+                "DELETE",
+                f"{API_BASE}/liveStreams",
+                access_token=access_token,
+                params={"id": stream_id},
+            )
+            return True
+        except Exception:
+            logger.warning("Could not delete YouTube live stream %s", stream_id, exc_info=True)
+            return False
+
+    def get_granted_scopes(self, access_token: str) -> list[str] | None:
+        """Scopes the token actually carries, via Google's tokeninfo endpoint.
+
+        Costs no Data API quota. Returns None when the token cannot be
+        inspected (expired, revoked, network failure) — the caller treats
+        that as \"unknown\", not as \"missing\", and refreshes first.
+        """
+        try:
+            resp = self._request(
+                "GET",
+                TOKENINFO_URL,
+                params={"access_token": access_token},
+                timeout=10,
+            )
+        except Exception:
+            logger.warning("Could not inspect YouTube token scopes", exc_info=True)
+            return None
+        scope = resp.json().get("scope", "")
+        return scope.split() if scope else []

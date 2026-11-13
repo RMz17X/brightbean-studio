@@ -25,6 +25,7 @@ from apps.credentials.models import PlatformCredential, derive_is_configured
 from apps.members.decorators import require_permission
 from providers.exceptions import QuotaExceededError
 
+from . import profile_service
 from .error_messages import quota_connect_error
 from .models import MastodonAppRegistration, PlatformVisibility, SocialAccount
 from .oauth_aliases import from_url_slug, redirect_uri_from_request, to_url_slug
@@ -179,7 +180,7 @@ def account_list(request, workspace_id):
     """List connected social accounts for a workspace."""
     accounts = (
         SocialAccount.objects.for_workspace(workspace_id)
-        .prefetch_related("posting_slots")
+        .prefetch_related("posting_slots", "zernio_binding")
         .order_by("platform", "account_name")
     )
     configured_platforms = _get_configured_platforms(request.org.id)
@@ -759,6 +760,18 @@ def reconnect(request, workspace_id, account_id):
     account = get_object_or_404(SocialAccount.objects.for_workspace(workspace_id), id=account_id)
     platform = account.platform
 
+    # Zernio is a transport, not an OAuth platform: its accounts are
+    # reconnected by (re)binding an API key on the Zernio page, so there is
+    # no auth URL to redirect to (ZernioProvider.get_auth_url raises
+    # NotImplementedError). Send the user there instead of 500ing.
+    if account.is_via_zernio:
+        messages.info(
+            request,
+            f"{account.display_label} connects through Zernio, not OAuth. "
+            "Reconnect it by checking its key/binding on the Zernio page.",
+        )
+        return redirect("zernio:dashboard", workspace_id=workspace_id)
+
     if platform == PlatformCredential.Platform.BLUESKY:
         return redirect("social_accounts:connect_bluesky", workspace_id=workspace_id)
     if platform == PlatformCredential.Platform.MASTODON:
@@ -840,6 +853,48 @@ def _render_account_card(request, account, workspace_id):
         "social_accounts/partials/_account_card.html",
         {"account": account, "workspace_id": workspace_id},
     )
+
+
+# ------------------------------------------------------------------
+# Update profile
+# ------------------------------------------------------------------
+
+
+@login_required
+@require_permission("manage_social_accounts")
+@require_POST
+@ratelimit(key="user", rate="10/m", method="POST", block=True)
+def update_profile(request, workspace_id, account_id):
+    """Update an account's public profile from the account card form.
+
+    One shared service with the Agent API (``profile_service``), so the
+    web form and ``PATCH /api/v1/accounts/{id}/profile`` gate, validate
+    and call the provider identically. The form itself only offers
+    fields the platform can actually update (see
+    ``_profile_form.html``); a stale form or direct POST for a
+    platform that can't update still lands here and gets the
+    service's plain-language refusal instead of a provider error.
+    """
+    account = get_object_or_404(SocialAccount.objects.for_workspace(workspace_id), id=account_id)
+
+    def _field(name: str) -> str | None:
+        value = (request.POST.get(name) or "").strip()
+        return value or None
+
+    try:
+        profile_service.update_account_profile(
+            account,
+            description=_field("description"),
+            about=_field("about"),
+            website=_field("website"),
+            phone=_field("phone"),
+        )
+    except profile_service.ProfileServiceError as exc:
+        messages.error(request, exc.message)
+        return redirect("social_accounts:list", workspace_id=workspace_id)
+
+    messages.success(request, f"Profil {account.display_label} diperbarui.")
+    return redirect("social_accounts:list", workspace_id=workspace_id)
 
 
 # ------------------------------------------------------------------

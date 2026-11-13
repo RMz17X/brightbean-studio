@@ -25,7 +25,7 @@ from ninja.errors import HttpError
 from apps.analytics.api_builders import build_account_analytics, build_post_analytics
 from apps.api.limits import check_platform_quota
 from apps.api.pagination import decode_offset_cursor, encode_offset_cursor
-from apps.api.schemas import PostResponse
+from apps.api.schemas import LiveBroadcastResponse, PostResponse
 from apps.composer.models import PlatformPost, Post
 from apps.composer.services import create_post, transition_platform_post
 from apps.inbox.models import InboxMessage, InboxReply
@@ -36,9 +36,11 @@ from apps.inbox.services import (
     send_reply_now,
     update_reply_draft,
 )
-from apps.mcp.protocol import INVALID_PARAMS, JsonRpcError
+from apps.mcp.protocol import INTERNAL_ERROR, INVALID_PARAMS, JsonRpcError
 from apps.mcp.tools import Tool, register_tool
-from apps.social_accounts.models import SocialAccount
+from apps.social_accounts import live_service
+from apps.social_accounts.live_service import LiveServiceError
+from apps.social_accounts.models import LiveBroadcast, SocialAccount
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -169,7 +171,7 @@ def _get_post_for_key(api_key, post_id_str: str) -> Post:
     """
     post_id = _parse_uuid(post_id_str, "post_id")
     try:
-        return _visible_posts_qs(api_key).prefetch_related("platform_posts__social_account").get(id=post_id)
+        return _visible_posts_qs(api_key).prefetch_related("platform_posts__social_account__zernio_binding").get(id=post_id)
     except Post.DoesNotExist as exc:
         raise JsonRpcError(INVALID_PARAMS, "Post not found") from exc
 
@@ -200,7 +202,17 @@ def _list_accounts(args: dict, context: dict[str, Any]) -> dict:
     # Reuse the REST schema so MCP and REST stay byte-identical (Gap 4 + 5).
     from apps.api.schemas import AccountSummary
 
-    accounts = [AccountSummary.from_social_account(sa).model_dump(mode="json") for sa in api_key.social_accounts.all()]
+    # The OAuth actor's ``social_accounts`` is a duck-type shim
+    # (``_AllWorkspaceAccounts``) that only implements ``.all()`` — prefetch
+    # only when the real manager is behind it; the per-account binding
+    # lookup in ``display_platform`` still resolves, just without the batch.
+    accounts_qs = api_key.social_accounts
+    if hasattr(accounts_qs, "prefetch_related"):
+        accounts_qs = accounts_qs.prefetch_related("zernio_binding")
+    accounts = [
+        AccountSummary.from_social_account(sa).model_dump(mode="json")
+        for sa in accounts_qs.all()
+    ]
     return _wrap_text({"accounts": accounts})
 
 
@@ -336,7 +348,7 @@ def _schedule_post(args: dict, context: dict[str, Any]) -> dict:
     except HttpError as exc:
         raise JsonRpcError(
             INVALID_PARAMS,
-            f"Per-platform daily quota reached for {sa.platform}: {exc.message}",
+            f"Per-platform daily quota reached for {sa.display_platform_label}: {exc.message}",
         ) from exc
     try:
         post = create_post(
@@ -463,7 +475,7 @@ def _list_posts(args: dict, context: dict[str, Any]) -> dict:
     # The allowlist lives in the queryset (see ``_visible_posts_qs``), so paging
     # is over posts this key can actually see — no scan cap, nothing silently
     # dropped. ``id`` tiebreaks ``-created_at`` to keep offsets stable.
-    qs = _visible_posts_qs(api_key).prefetch_related("platform_posts__social_account")
+    qs = _visible_posts_qs(api_key).prefetch_related("platform_posts__social_account__zernio_binding")
     if status:
         qs = qs.filter(Exists(PlatformPost.objects.filter(post_id=OuterRef("pk"), status=status)))
     qs = qs.order_by("-created_at", "id")
@@ -611,7 +623,7 @@ def _schedule_draft(args: dict, context: dict[str, Any]) -> dict:
         except HttpError as exc:
             raise JsonRpcError(
                 INVALID_PARAMS,
-                f"Per-platform daily quota reached for {pp.social_account.platform}: {exc.message}",
+                f"Per-platform daily quota reached for {pp.social_account.display_platform_label}: {exc.message}",
             ) from exc
 
     # Wrap the per-child loop in a single outer atomic — same reasoning
@@ -1614,5 +1626,302 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_send_reply,
+    )
+)
+
+
+# ---------------------------------------------------------------------------
+# Tool: live_create / live_list / live_transition / live_delete
+# ---------------------------------------------------------------------------
+# YouTube Live broadcasts. These delegate to the same
+# ``apps.social_accounts.live_service`` functions the web monitor and the
+# REST router use, so the three surfaces cannot drift. The full stream
+# key is returned exactly once, by ``live_create`` (and by the REST
+# recreate-stream endpoint) — list/detail never return it.
+
+
+def _serialize_live_broadcast(broadcast: LiveBroadcast, *, stream_key: str | None = None) -> dict:
+    """Serialize a broadcast for an MCP tool response.
+
+    Delegates to the same Pydantic schema the REST router returns so
+    the two surfaces cannot drift in either field set or wire format.
+    """
+    return LiveBroadcastResponse.from_broadcast(broadcast, stream_key=stream_key).model_dump(mode="json")
+
+
+def _map_live_service_error(exc: LiveServiceError) -> JsonRpcError:
+    """Map a service failure onto a JSON-RPC error.
+
+    Client-side failures (bad input, missing Live scope) are
+    INVALID_PARAMS; a YouTube-side failure is INTERNAL_ERROR.
+    """
+    code = INVALID_PARAMS if exc.status_code in (400, 403, 422) else INTERNAL_ERROR
+    return JsonRpcError(code, exc.message)
+
+
+def _resolve_live_broadcast(api_key, broadcast_id_str: str) -> LiveBroadcast:
+    """Allowlist-respecting broadcast fetch shared by the Live tools.
+
+    Out-of-scope and nonexistent both surface as "broadcast not found" —
+    the API never reveals which is which (same rule as ``_get_post_for_key``).
+    """
+    broadcast_id = _parse_uuid(broadcast_id_str, "broadcast_id")
+    allowed = {sa.id for sa in api_key.social_accounts.all()}
+    try:
+        broadcast = LiveBroadcast.objects.select_related("social_account").get(
+            id=broadcast_id, workspace_id=api_key.workspace_id
+        )
+    except LiveBroadcast.DoesNotExist as exc:
+        raise JsonRpcError(INVALID_PARAMS, "broadcast not found") from exc
+    if broadcast.social_account_id not in allowed:
+        raise JsonRpcError(INVALID_PARAMS, "broadcast not found")
+    return broadcast
+
+
+def _live_create(args: dict, context: dict[str, Any]) -> dict:
+    _require_perm(context, "create_posts")
+    api_key = context["api_key"]
+    if "social_account_id" not in args:
+        raise JsonRpcError(INVALID_PARAMS, "social_account_id is required")
+    if not args.get("title"):
+        raise JsonRpcError(INVALID_PARAMS, "title is required")
+    sa = _resolve_allowed_account(api_key, args["social_account_id"])
+    if sa.platform != "youtube":
+        raise JsonRpcError(INVALID_PARAMS, "social_account_id must reference a connected YouTube account")
+    if sa.connection_status != SocialAccount.ConnectionStatus.CONNECTED:
+        raise JsonRpcError(INVALID_PARAMS, "The YouTube account is not connected")
+    scheduled_start = None
+    if args.get("scheduled_start") is not None:
+        scheduled_start = _parse_iso_datetime(args["scheduled_start"], "scheduled_start")
+    try:
+        broadcast, stream_key = live_service.create_live_broadcast(
+            api_key.workspace,
+            sa,
+            title=args["title"],
+            description=args.get("description", ""),
+            privacy_status=args.get("privacy_status", "private"),
+            resolution=args.get("resolution", "1080p"),
+            frame_rate=args.get("frame_rate", "30fps"),
+            scheduled_start=scheduled_start,
+        )
+    except LiveServiceError as exc:
+        raise _map_live_service_error(exc) from exc
+    # The create response discloses the key exactly once, mirroring the
+    # web created-page: mark it shown before serializing so the response
+    # is truthful about ``key_shown``.
+    live_service.mark_key_shown(broadcast)
+    return _wrap_text(_serialize_live_broadcast(broadcast, stream_key=stream_key))
+
+
+register_tool(
+    Tool(
+        name="live_create",
+        description=(
+            "Create a YouTube live broadcast plus its RTMP ingest stream. Returns the broadcast "
+            "with its RTMPS URL and the FULL stream key — the key is shown exactly once here, "
+            "so copy it into OBS (Service YouTube - RTMPS) immediately; later calls only ever "
+            "return the masked key. Nothing goes live until live_transition with action "
+            "'go_live'. The target account needs the full youtube OAuth scope — an upload-only "
+            "grant fails until the account is reconnected for Live from the web monitor. "
+            "Requires the create_posts permission."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "social_account_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "A connected YouTube account in this key's allowlist (see list_accounts).",
+                },
+                "title": {"type": "string", "minLength": 1, "maxLength": 100},
+                "description": {"type": "string", "maxLength": 5000},
+                "privacy_status": {
+                    "type": "string",
+                    "enum": ["public", "unlisted", "private"],
+                    "default": "private",
+                },
+                "resolution": {
+                    "type": "string",
+                    "enum": ["2160p", "1080p", "720p", "480p", "360p", "240p", "144p"],
+                    "default": "1080p",
+                },
+                "frame_rate": {"type": "string", "enum": ["30fps", "60fps"], "default": "30fps"},
+                "scheduled_start": {
+                    "type": "string",
+                    "description": "Optional scheduled start, ISO 8601. A tz-less value is read as UTC.",
+                },
+            },
+            "required": ["social_account_id", "title"],
+            "additionalProperties": False,
+        },
+        handler=_live_create,
+    )
+)
+
+
+def _live_list(args: dict, context: dict[str, Any]) -> dict:
+    api_key = context["api_key"]
+    status = args.get("status")
+    if status is not None and status not in LiveBroadcast.Status.values:
+        raise JsonRpcError(
+            INVALID_PARAMS, f"status must be one of {', '.join(LiveBroadcast.Status.values)}"
+        )
+    limit = args.get("limit", 50)
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 100:
+        raise JsonRpcError(INVALID_PARAMS, "limit must be an integer between 1 and 100")
+    try:
+        offset = decode_offset_cursor(args.get("cursor"))
+    except ValueError as exc:
+        raise JsonRpcError(INVALID_PARAMS, "cursor is not a valid pagination cursor") from exc
+    allowed = {sa.id for sa in api_key.social_accounts.all()}
+    qs = (
+        LiveBroadcast.objects.for_workspace(api_key.workspace_id)
+        .filter(social_account_id__in=allowed)
+        .select_related("social_account")
+    )
+    if status:
+        qs = qs.filter(status=status)
+    if args.get("social_account_id") is not None:
+        sa = _resolve_allowed_account(api_key, args["social_account_id"])
+        qs = qs.filter(social_account_id=sa.id)
+    qs = qs.order_by("-created_at", "id")
+    rows = list(qs[offset : offset + limit + 1])
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    if args.get("refresh"):
+        # Refresh the live state of active broadcasts from YouTube before
+        # serializing. Throttled to one poll per 45 s per broadcast inside
+        # the service, so repeated calls cost no extra quota.
+        for broadcast in rows:
+            if broadcast.is_active:
+                live_service.refresh_broadcast_status(broadcast)
+                broadcast.refresh_from_db()
+    return _wrap_text(
+        {
+            "broadcasts": [_serialize_live_broadcast(b) for b in rows],
+            "limit": limit,
+            "next_cursor": encode_offset_cursor(offset + limit) if has_more else None,
+        }
+    )
+
+
+register_tool(
+    Tool(
+        name="live_list",
+        description=(
+            "List YouTube live broadcasts in this workspace (newest first), with lifecycle "
+            "status, stream/health status, current viewers, uptime and watch URL. Pass "
+            "refresh=true to poll YouTube for the latest state of active broadcasts first "
+            "(throttled to one poll per 45 s per broadcast, 1 quota unit each). The stream "
+            "key is never returned here — only the masked form."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": list(LiveBroadcast.Status.values),
+                    "description": "Filter by lifecycle status.",
+                },
+                "social_account_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "Filter to one allowlisted account.",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+                "cursor": {"type": "string", "description": "Pagination cursor from a previous call."},
+                "refresh": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Poll YouTube for fresh state of active broadcasts before listing.",
+                },
+            },
+            "additionalProperties": False,
+        },
+        handler=_live_list,
+        read_only=True,
+    )
+)
+
+
+def _live_transition(args: dict, context: dict[str, Any]) -> dict:
+    _require_perm(context, "create_posts")
+    api_key = context["api_key"]
+    if "broadcast_id" not in args:
+        raise JsonRpcError(INVALID_PARAMS, "broadcast_id is required")
+    action = args.get("action")
+    mapping = {"test": "testing", "go_live": "live", "stop": "complete"}
+    if action not in mapping:
+        raise JsonRpcError(INVALID_PARAMS, "action must be one of: test, go_live, stop")
+    broadcast = _resolve_live_broadcast(api_key, args["broadcast_id"])
+    target = mapping[action]
+    if target == "live" and broadcast.privacy_status == "public" and not args.get("confirm"):
+        raise JsonRpcError(
+            INVALID_PARAMS,
+            "This broadcast is PUBLIC. Pass confirm=true to go live — viewers will be able to watch immediately.",
+        )
+    try:
+        live_service.transition_live_broadcast(broadcast, target)
+    except LiveServiceError as exc:
+        raise _map_live_service_error(exc) from exc
+    return _wrap_text(_serialize_live_broadcast(broadcast))
+
+
+register_tool(
+    Tool(
+        name="live_transition",
+        description=(
+            "Move a YouTube live broadcast to testing ('test'), live ('go_live') or complete "
+            "('stop'). Going live on a PUBLIC broadcast requires confirm=true — private/unlisted "
+            "broadcasts go live without it. Requires the create_posts permission."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "broadcast_id": {"type": "string", "format": "uuid"},
+                "action": {"type": "string", "enum": ["test", "go_live", "stop"]},
+                "confirm": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Required when going live on a PUBLIC broadcast.",
+                },
+            },
+            "required": ["broadcast_id", "action"],
+            "additionalProperties": False,
+        },
+        handler=_live_transition,
+    )
+)
+
+
+def _live_delete(args: dict, context: dict[str, Any]) -> dict:
+    _require_perm(context, "create_posts")
+    api_key = context["api_key"]
+    if "broadcast_id" not in args:
+        raise JsonRpcError(INVALID_PARAMS, "broadcast_id is required")
+    broadcast = _resolve_live_broadcast(api_key, args["broadcast_id"])
+    # Capture the ids first: Django clears ``pk`` on the in-memory object
+    # once the row is deleted, so reading them afterwards yields None.
+    row_id, yt_broadcast_id = broadcast.id, broadcast.broadcast_id
+    live_service.delete_live_broadcast(broadcast)
+    return _wrap_text({"id": str(row_id), "broadcast_id": yt_broadcast_id, "deleted": True})
+
+
+register_tool(
+    Tool(
+        name="live_delete",
+        description=(
+            "Delete a YouTube live broadcast and its ingest stream, on YouTube and locally. "
+            "Requires the create_posts permission."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "broadcast_id": {"type": "string", "format": "uuid"},
+            },
+            "required": ["broadcast_id"],
+            "additionalProperties": False,
+        },
+        handler=_live_delete,
     )
 )

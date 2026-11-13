@@ -1,0 +1,293 @@
+{% extends "base.html" %}
+{% block title %}YouTube Live | Hijitoko Studio{% endblock %}
+{% block page_title %}YouTube Live{% endblock %}
+{% block content %}
+<div class="max-w-5xl mx-auto space-y-6">
+
+    <div class="flex items-start justify-between gap-4">
+        <div>
+            <h1 class="text-lg font-semibold text-stone-900">YouTube Live</h1>
+            <p class="text-sm text-stone-500 mt-1">Create a live broadcast, paste the RTMP details into OBS, go live, and watch the stream health and viewers here.</p>
+        </div>
+        <a href="#create-live" class="shrink-0 inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-orange-600 rounded-full hover:bg-orange-700 transition-colors">Create Live Broadcast</a>
+    </div>
+
+    {% if not accounts %}
+    <div class="bg-white border border-stone-200 rounded-xl p-6">
+        <h2 class="text-sm font-semibold text-stone-900">No YouTube account connected</h2>
+        <p class="text-sm text-stone-500 mt-1">Connect the channel owner's YouTube account first. After connecting, come back here and reconnect it for Live — live streaming needs a wider permission than uploading.</p>
+        <a href="{% url 'social_accounts:connect' workspace_id=workspace_id %}" class="mt-4 inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-orange-600 bg-orange-50 border border-orange-200 rounded-full hover:bg-orange-100">Connect YouTube</a>
+    </div>
+    {% endif %}
+
+    {% for account in accounts %}
+        {% if account.live_ready is False %}
+        <div class="bg-amber-50 border border-amber-200 rounded-xl p-5">
+            <h2 class="text-sm font-semibold text-amber-900">Live permission missing — {{ account.account_name }}</h2>
+            <p class="text-sm text-amber-800 mt-1">This account was connected for uploads only. Live streaming needs the full YouTube permission (<code class="text-xs bg-amber-100 px-1 py-0.5 rounded">{{ live_scope }}</code>). Reconnecting replaces the token with a wider grant — uploads keep working. The Google Cloud consent screen must also list this scope, or Google will refuse it.</p>
+            <form method="post" action="{% url 'live:reconnect' workspace_id=workspace_id account_id=account.pk %}" class="mt-3">
+                {% csrf_token %}
+                <button type="submit" class="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-amber-600 rounded-full hover:bg-amber-700">Reconnect for Live</button>
+            </form>
+        </div>
+        {% elif account.live_ready is None %}
+        <div class="bg-stone-50 border border-stone-200 rounded-xl p-5">
+            <h2 class="text-sm font-semibold text-stone-900">Live permission could not be checked — {{ account.account_name }}</h2>
+            <p class="text-sm text-stone-500 mt-1">Google did not answer the permission check (expired or revoked token, or a network hiccup). Try refreshing this page; if it persists, reconnect the account for Live.</p>
+            <form method="post" action="{% url 'live:reconnect' workspace_id=workspace_id account_id=account.pk %}" class="mt-3">
+                {% csrf_token %}
+                <button type="submit" class="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-stone-700 bg-white border border-stone-300 rounded-full hover:bg-stone-100">Reconnect for Live</button>
+            </form>
+        </div>
+        {% else %}
+        <div class="bg-emerald-50 border border-emerald-200 rounded-xl px-5 py-3 flex items-center gap-2">
+            <span class="inline-block w-2 h-2 rounded-full bg-emerald-500"></span>
+            <p class="text-sm text-emerald-900"><strong>{{ account.account_name }}</strong> is ready for Live.</p>
+        </div>
+        {% endif %}
+    {% endfor %}
+
+    {% if active_broadcasts %}
+    <div>
+        <h2 class="text-sm font-semibold text-stone-900 mb-3">Ready, testing, or on air</h2>
+        <div class="space-y-4">
+        {% for broadcast in active_broadcasts %}
+            <div class="bg-white border border-red-200 rounded-xl p-5" data-broadcast-id="{{ broadcast.broadcast_id }}" data-live-active="1">
+                <div class="flex items-start justify-between gap-4">
+                    <div class="min-w-0">
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-semibold rounded-full {% if broadcast.status == 'live' %}bg-red-600 text-white{% else %}bg-amber-100 text-amber-800{% endif %}">
+                                <span class="w-1.5 h-1.5 rounded-full bg-current inline-block"></span>
+                                {{ broadcast.get_status_display }}
+                            </span>
+                            <span class="text-xs text-stone-400">{{ broadcast.social_account.account_name }}</span>
+                        </div>
+                        <h3 class="text-base font-semibold text-stone-900 mt-2 truncate">{{ broadcast.title }}</h3>
+                        <a href="{{ broadcast.watch_url }}" target="_blank" rel="noopener" class="text-xs text-orange-600 hover:underline">Watch on YouTube</a>
+                    </div>
+                    <div class="text-right shrink-0">
+                        <p class="text-xs text-stone-400">Viewers now</p>
+                        <p class="text-2xl font-semibold text-stone-900" data-field="viewers">{% if broadcast.last_viewers is not None %}{{ broadcast.last_viewers }}{% else %}—{% endif %}</p>
+                        <p class="text-xs text-stone-500 mt-1">On air <span data-field="uptime" {% if broadcast.actual_start %}data-start="{{ broadcast.actual_start|date:'c' }}"{% endif %}>{% if broadcast.uptime is not None %}{{ broadcast.uptime }}s{% else %}—{% endif %}</span></p>
+                    </div>
+                </div>
+
+                <dl class="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4 text-xs">
+                    <div><dt class="text-stone-400">Stream</dt><dd class="font-medium text-stone-900" data-field="stream_status">{{ broadcast.last_stream_status|default:"—" }}</dd></div>
+                    <div><dt class="text-stone-400">Health</dt><dd class="font-medium text-stone-900" data-field="health_status">{{ broadcast.last_health_status|default:"—" }}</dd></div>
+                    <div><dt class="text-stone-400">Started</dt><dd class="font-medium text-stone-900">{% if broadcast.actual_start %}{{ broadcast.actual_start|date:"Y-m-d H:i" }}{% else %}—{% endif %}</dd></div>
+                    <div><dt class="text-stone-400">Scheduled</dt><dd class="font-medium text-stone-900">{% if broadcast.scheduled_start %}{{ broadcast.scheduled_start|date:"Y-m-d H:i" }}{% else %}—{% endif %}</dd></div>
+                </dl>
+                {% if broadcast.last_error %}
+                <p class="text-xs text-red-600 mt-3">Last poll failed: {{ broadcast.last_error }}</p>
+                {% endif %}
+
+                <div class="bg-stone-50 border border-stone-200 rounded-lg p-3 mt-4 space-y-2 text-xs">
+                    <div class="flex items-center gap-2">
+                        <span class="w-20 shrink-0 text-stone-400">RTMPS URL</span>
+                        <code class="flex-1 min-w-0 truncate bg-white border border-stone-200 rounded px-2 py-1">{{ broadcast.rtmps_url }}</code>
+                        <button type="button" class="copy-btn shrink-0 px-2 py-1 font-semibold text-stone-700 bg-white border border-stone-300 rounded-full hover:bg-stone-100" data-copy="{{ broadcast.rtmps_url }}">Copy</button>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span class="w-20 shrink-0 text-stone-400">Stream key</span>
+                        <code class="flex-1 min-w-0 truncate bg-white border border-stone-200 rounded px-2 py-1">{{ broadcast.masked_stream_key }}</code>
+                        <button type="button" class="reveal-btn shrink-0 px-2 py-1 font-semibold text-stone-700 bg-white border border-stone-300 rounded-full hover:bg-stone-100" data-reveal-url="{% url 'live:reveal_key' workspace_id=workspace_id broadcast_id=broadcast.pk %}">Copy key</button>
+                    </div>
+                    <p class="text-stone-400">In OBS: Settings → Stream → Service YouTube - RTMPS, paste the URL as Server and the key as Stream Key. Never share the key.</p>
+                </div>
+
+                <div class="flex flex-wrap gap-2 mt-4">
+                    {% if broadcast.status == 'ready' %}
+                    <form method="post" action="{% url 'live:transition' workspace_id=workspace_id broadcast_id=broadcast.pk %}">{% csrf_token %}<input type="hidden" name="action" value="test"><button type="submit" class="px-4 py-2 text-xs font-semibold text-stone-700 bg-white border border-stone-300 rounded-full hover:bg-stone-100">Start test</button></form>
+                    {% endif %}
+                    {% if broadcast.status == 'testing' or broadcast.status == 'ready' %}
+                    <form method="post" action="{% url 'live:transition' workspace_id=workspace_id broadcast_id=broadcast.pk %}"{% if broadcast.privacy_status == 'public' %} onsubmit="return confirm('Go live now? This broadcast is PUBLIC — viewers will be able to watch immediately.');"{% endif %}>{% csrf_token %}<input type="hidden" name="action" value="go_live"><button type="submit" class="px-4 py-2 text-xs font-semibold text-white bg-red-600 rounded-full hover:bg-red-700">Go Live</button></form>
+                    {% endif %}
+                    {% if broadcast.status == 'live' or broadcast.status == 'testing' %}
+                    <form method="post" action="{% url 'live:transition' workspace_id=workspace_id broadcast_id=broadcast.pk %}">{% csrf_token %}<input type="hidden" name="action" value="stop"><button type="submit" class="px-4 py-2 text-xs font-semibold text-white bg-stone-800 rounded-full hover:bg-stone-900">Stop</button></form>
+                    {% endif %}
+                    <button type="button" class="refresh-btn px-4 py-2 text-xs font-semibold text-stone-700 bg-white border border-stone-300 rounded-full hover:bg-stone-100">Refresh status</button>
+                    <form method="post" action="{% url 'live:delete' workspace_id=workspace_id broadcast_id=broadcast.pk %}" onsubmit="return confirm('Delete this broadcast from YouTube and from the monitor?');">{% csrf_token %}<button type="submit" class="px-4 py-2 text-xs font-semibold text-red-600 bg-white border border-red-200 rounded-full hover:bg-red-50">Delete</button></form>
+                </div>
+            </div>
+        {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    {% if accounts %}
+    <div id="create-live" class="bg-white border border-stone-200 rounded-xl p-6">
+        <h2 class="text-sm font-semibold text-stone-900">Create a new live broadcast</h2>
+        <p class="text-xs text-stone-500 mt-1">This only creates the broadcast and its ingest stream — nothing goes live until you press Go Live. Each create / transition call costs 1 quota unit from the regular 10,000-unit daily pool.</p>
+        <form method="post" action="{% url 'live:create' workspace_id=workspace_id %}" class="mt-4 space-y-4">
+            {% csrf_token %}
+            <div>
+                <label for="account_id" class="block text-xs font-medium text-stone-700 mb-1">YouTube account</label>
+                <select id="account_id" name="account_id" class="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg bg-white">
+                    {% for account in accounts %}<option value="{{ account.pk }}">{{ account.account_name }}</option>{% endfor %}
+                </select>
+            </div>
+            <div>
+                <label for="title" class="block text-xs font-medium text-stone-700 mb-1">Title</label>
+                <input id="title" name="title" type="text" required maxlength="100" class="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg" placeholder="e.g. Breaking: Rupiah melemah — live update">
+            </div>
+            <div>
+                <label for="description" class="block text-xs font-medium text-stone-700 mb-1">Description (optional)</label>
+                <textarea id="description" name="description" rows="3" class="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg"></textarea>
+            </div>
+            <div>
+                <label for="privacy_status" class="block text-xs font-medium text-stone-700 mb-1">Privacy</label>
+                <select id="privacy_status" name="privacy_status" class="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg bg-white">
+                    <option value="private" selected>Private</option>
+                    <option value="unlisted">Unlisted</option>
+                    <option value="public">Public</option>
+                </select>
+            </div>
+            <details class="border border-stone-200 rounded-lg">
+                <summary class="px-3 py-2 text-xs font-medium text-stone-700 cursor-pointer select-none">Advanced</summary>
+                <div class="grid grid-cols-2 sm:grid-cols-3 gap-4 px-3 pb-3">
+                <div>
+                    <label for="resolution" class="block text-xs font-medium text-stone-700 mb-1">Resolution</label>
+                    <select id="resolution" name="resolution" class="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg bg-white">
+                        {% for r in resolutions %}<option value="{{ r }}" {% if r == '1080p' %}selected{% endif %}>{{ r }}</option>{% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label for="frame_rate" class="block text-xs font-medium text-stone-700 mb-1">Frame rate</label>
+                    <select id="frame_rate" name="frame_rate" class="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg bg-white">
+                        {% for f in frame_rates %}<option value="{{ f }}" {% if f == '30fps' %}selected{% endif %}>{{ f }}</option>{% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label for="scheduled_start" class="block text-xs font-medium text-stone-700 mb-1">Scheduled start (optional)</label>
+                    <input id="scheduled_start" name="scheduled_start" type="datetime-local" class="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg">
+                </div>
+                </div>
+            </details>
+            <button type="submit" class="inline-flex items-center px-4 py-2 text-xs font-semibold text-white bg-orange-600 rounded-full hover:bg-orange-700">Create broadcast</button>
+        </form>
+    </div>
+    {% endif %}
+
+    <div class="bg-white border border-stone-200 rounded-xl p-6">
+        <h2 class="text-sm font-semibold text-stone-900 mb-3">All broadcasts</h2>
+        {% if broadcasts %}
+        <table class="w-full text-sm">
+            <thead>
+                <tr class="text-left text-xs text-stone-400 border-b border-stone-200">
+                    <th class="py-2 pr-3 font-medium">Title</th>
+                    <th class="py-2 pr-3 font-medium">Status</th>
+                    <th class="py-2 pr-3 font-medium">Scheduled</th>
+                    <th class="py-2 pr-3 font-medium">Started</th>
+                    <th class="py-2 pr-3 font-medium">Viewers</th>
+                    <th class="py-2 font-medium"></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for broadcast in broadcasts %}
+                <tr class="border-b border-stone-100">
+                    <td class="py-2 pr-3 font-medium text-stone-900">{{ broadcast.title }}</td>
+                    <td class="py-2 pr-3">{{ broadcast.get_status_display }}</td>
+                    <td class="py-2 pr-3 text-stone-500">{% if broadcast.scheduled_start %}{{ broadcast.scheduled_start|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
+                    <td class="py-2 pr-3 text-stone-500">{% if broadcast.actual_start %}{{ broadcast.actual_start|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
+                    <td class="py-2 pr-3 text-stone-500">{% if broadcast.last_viewers is not None %}{{ broadcast.last_viewers }}{% else %}—{% endif %}</td>
+                    <td class="py-2 text-right">
+                        {% if broadcast.status == 'ready' or broadcast.status == 'testing' %}
+                        <a href="{% url 'live:created' workspace_id=workspace_id broadcast_id=broadcast.pk %}" class="text-xs text-orange-600 hover:underline">RTMP details</a>
+                        {% endif %}
+                        <a href="{{ broadcast.watch_url }}" target="_blank" rel="noopener" class="text-xs text-orange-600 hover:underline ml-3">Watch</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p class="text-sm text-stone-500">No broadcasts yet. Create one above — it stays private and offline until you go live.</p>
+        {% endif %}
+    </div>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script nonce="{{ request.csp_nonce }}">
+(function () {
+    var pollSeconds = {{ poll_interval_seconds|default:60 }};
+    var statusUrl = "{% url 'live:status' workspace_id=workspace_id %}";
+    var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]') ? document.querySelector('[name=csrfmiddlewaretoken]').value : '';
+
+    function fmtUptime(seconds) {
+        if (seconds === null || seconds === undefined) return '—';
+        var h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60), s = seconds % 60;
+        if (h > 0) return h + 'h ' + m + 'm';
+        if (m > 0) return m + 'm ' + s + 's';
+        return s + 's';
+    }
+    function tickUptimes() {
+        document.querySelectorAll('[data-field="uptime"][data-start]').forEach(function (el) {
+            var start = new Date(el.getAttribute('data-start')).getTime();
+            if (!isNaN(start)) el.textContent = fmtUptime(Math.max(0, Math.floor((Date.now() - start) / 1000)));
+        });
+    }
+    setInterval(tickUptimes, 1000);
+    tickUptimes();
+
+    function applyStatus(item) {
+        var card = document.querySelector('[data-broadcast-id="' + item.broadcast_id + '"]');
+        if (!card) return;
+        var viewers = card.querySelector('[data-field="viewers"]');
+        if (viewers) viewers.textContent = (item.viewers === null || item.viewers === undefined) ? '—' : item.viewers;
+        var stream = card.querySelector('[data-field="stream_status"]');
+        if (stream) stream.textContent = item.stream_status || '—';
+        var health = card.querySelector('[data-field="health_status"]');
+        if (health) health.textContent = item.health_status || '—';
+        var uptime = card.querySelector('[data-field="uptime"]');
+        if (uptime) {
+            if (item.actual_start) uptime.setAttribute('data-start', item.actual_start);
+            uptime.textContent = fmtUptime(item.uptime_seconds);
+        }
+    }
+    function poll() {
+        if (document.visibilityState !== 'visible') return;
+        if (!document.querySelector('[data-live-active]')) return;
+        fetch(statusUrl, {headers: {'X-Requested-With': 'XMLHttpRequest'}})
+            .then(function (r) { return r.json(); })
+            .then(function (data) { (data.broadcasts || []).forEach(applyStatus); })
+            .catch(function () { /* next poll retries; server keeps last known state */ });
+    }
+    setInterval(poll, pollSeconds * 1000);
+
+    document.querySelectorAll('.refresh-btn').forEach(function (btn) {
+        btn.addEventListener('click', poll);
+    });
+
+    document.querySelectorAll('.copy-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            var text = btn.getAttribute('data-copy') || '';
+            navigator.clipboard.writeText(text).then(function () {
+                btn.textContent = 'Copied';
+                setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
+            });
+        });
+    });
+
+    document.querySelectorAll('.reveal-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            fetch(btn.getAttribute('data-reveal-url'), {
+                method: 'POST',
+                headers: {'X-CSRFToken': csrfToken, 'X-Requested-With': 'XMLHttpRequest'}
+            })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.stream_key) {
+                    navigator.clipboard.writeText(data.stream_key).then(function () {
+                        btn.textContent = 'Key copied';
+                        setTimeout(function () { btn.textContent = 'Copy key'; }, 1500);
+                    });
+                }
+            });
+        });
+    });
+})();
+</script>
+{% endblock %}
