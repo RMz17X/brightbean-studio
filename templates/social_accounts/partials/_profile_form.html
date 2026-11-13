@@ -1,0 +1,75 @@
+{% comment %}
+Edit-public-profile form for one account card.
+
+Only fields the destination platform can actually update are offered —
+a form that cannot work is worse than no form. YouTube direct gets the
+channel description; a direct Facebook Page gets about / description /
+website / phone (no name — the Graph API cannot rename a Page). TikTok
+and Instagram have no update endpoint anywhere, and a via-Zernio
+YouTube/Facebook account has none through Zernio, so those get a
+plain-language note instead of a dead form.
+Usage: {% include "social_accounts/partials/_profile_form.html" with account=account workspace_id=workspace_id %}
+{% endcomment %}
+{% if account.connection_status == "connected" %}
+{% if account.display_platform == "youtube" and not account.is_via_zernio %}
+<div class="border-t border-stone-100 mt-4 pt-4">
+    <h4 class="text-xs font-semibold text-stone-700 uppercase tracking-wider">Channel Description</h4>
+    <p class="text-xs text-stone-400 mt-0.5 mb-3">Shown on your YouTube channel's About page. Max 1000 characters.</p>
+    <form method="post" action="{% url 'social_accounts:update_profile' workspace_id=workspace_id account_id=account.id %}">
+        {% csrf_token %}
+        <textarea name="description" rows="3" maxlength="1000" placeholder="Describe your channel…"
+                  class="w-full px-3 py-2 text-sm text-stone-900 bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500/30 focus:border-orange-400"></textarea>
+        <div class="flex justify-end mt-2">
+            <button type="submit" class="inline-flex items-center px-3 py-1.5 text-xs font-semibold text-white bg-stone-900 rounded-full hover:bg-stone-700 transition-colors cursor-pointer">Save description</button>
+        </div>
+    </form>
+</div>
+{% elif account.display_platform == "facebook" and not account.is_via_zernio %}
+<div class="border-t border-stone-100 mt-4 pt-4">
+    <h4 class="text-xs font-semibold text-stone-700 uppercase tracking-wider">Page Info</h4>
+    <p class="text-xs text-stone-400 mt-0.5 mb-3">Public info on your Facebook Page. Leave a field blank to keep its current value. The Page name cannot be changed here.</p>
+    <form method="post" action="{% url 'social_accounts:update_profile' workspace_id=workspace_id account_id=account.id %}">
+        {% csrf_token %}
+        <div class="space-y-2">
+            <div>
+                <label class="block text-xs font-medium text-stone-600 mb-1">About</label>
+                <input type="text" name="about" maxlength="255" placeholder="Short About text"
+                       class="w-full px-3 py-2 text-sm text-stone-900 bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500/30 focus:border-orange-400">
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-stone-600 mb-1">Description</label>
+                <textarea name="description" rows="2" maxlength="5000" placeholder="Longer Page description…"
+                          class="w-full px-3 py-2 text-sm text-stone-900 bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500/30 focus:border-orange-400"></textarea>
+            </div>
+            <div class="grid grid-cols-2 gap-2">
+                <div>
+                    <label class="block text-xs font-medium text-stone-600 mb-1">Website</label>
+                    <input type="url" name="website" maxlength="2000" placeholder="https://example.com"
+                           class="w-full px-3 py-2 text-sm text-stone-900 bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500/30 focus:border-orange-400">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-stone-600 mb-1">Phone</label>
+                    <input type="tel" name="phone" maxlength="50" placeholder="+62 …"
+                           class="w-full px-3 py-2 text-sm text-stone-900 bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500/30 focus:border-orange-400">
+                </div>
+            </div>
+        </div>
+        <div class="flex justify-end mt-2">
+            <button type="submit" class="inline-flex items-center px-3 py-1.5 text-xs font-semibold text-white bg-stone-900 rounded-full hover:bg-stone-700 transition-colors cursor-pointer">Save Page info</button>
+        </div>
+    </form>
+</div>
+{% elif account.display_platform == "youtube" and account.is_via_zernio %}
+<div class="border-t border-stone-100 mt-4 pt-4">
+    <p class="text-xs text-stone-500">Update deskripsi tidak tersedia via Zernio — sambungkan akun YouTube langsung untuk mengubah deskripsi channel.</p>
+</div>
+{% elif account.display_platform == "facebook" and account.is_via_zernio %}
+<div class="border-t border-stone-100 mt-4 pt-4">
+    <p class="text-xs text-stone-500">Update info Page tidak tersedia via Zernio — sambungkan akun Facebook Page langsung untuk mengubah info Page.</p>
+</div>
+{% elif account.display_platform == "tiktok" or account.display_platform == "instagram" %}
+<div class="border-t border-stone-100 mt-4 pt-4">
+    <p class="text-xs text-stone-500">Bio hanya bisa diubah manual di aplikasi TikTok/Instagram.</p>
+</div>
+{% endif %}
+{% endif %}
