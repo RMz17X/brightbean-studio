@@ -16,9 +16,10 @@ import uuid
 from typing import TYPE_CHECKING, Literal
 
 from ninja import Field, Schema
-from pydantic import field_serializer
+from pydantic import field_serializer, field_validator
 
 from providers import is_video_only, requires_media
+from providers.youtube import rtmps_ingestion_url
 
 if TYPE_CHECKING:
     from apps.analytics.derive import DerivedMetric
@@ -47,6 +48,14 @@ def _serialize_utc_z(value: dt.datetime | None) -> str | None:
 class AccountSummary(Schema):
     id: uuid.UUID
     platform: str
+    transport: str | None = Field(
+        None,
+        description=(
+            "Transport carrying publishes for this account: \"zernio\" when routed via Zernio, "
+            "null for a direct platform connection. ``platform`` is always the effective "
+            "destination platform (TikTok, YouTube, ...) — never the transport."
+        ),
+    )
     account_name: str
     account_handle: str = ""
     connection_status: str
@@ -96,7 +105,8 @@ class AccountSummary(Schema):
     def from_social_account(cls, sa) -> AccountSummary:
         return cls(
             id=sa.id,
-            platform=sa.platform,
+            platform=sa.display_platform,
+            transport=sa.transport,
             account_name=sa.account_name,
             account_handle=getattr(sa, "account_handle", "") or "",
             connection_status=sa.connection_status,
@@ -104,8 +114,8 @@ class AccountSummary(Schema):
             escaped_chars=sa.escaped_chars,
             needs_title=bool(sa.field_config.get("needs_title", False)),
             supports_first_comment=sa.supports_first_comment(),
-            requires_video=is_video_only(sa.platform),
-            requires_media=requires_media(sa.platform),
+            requires_video=is_video_only(sa.display_platform),
+            requires_media=requires_media(sa.display_platform),
         )
 
 
@@ -135,6 +145,54 @@ class MeResponse(Schema):
 
 class AccountsListResponse(Schema):
     accounts: list[AccountSummary]
+
+
+class AccountProfileUpdateRequest(Schema):
+    """Body for ``PATCH /accounts/{id}/profile``.
+
+    Which fields apply depends on the account's destination platform
+    (``GET /accounts/``): YouTube takes ``description`` only; a
+    Facebook Page takes ``about`` / ``description`` / ``website`` /
+    ``phone``. TikTok and Instagram take none — their bio can only be
+    changed in the app. Send at least one field; blank strings count
+    as omitted, never as "clear this field".
+    """
+
+    description: str | None = Field(
+        None,
+        max_length=5000,
+        description=(
+            "YouTube channel description (also the Page long description for Facebook). "
+            "YouTube enforces max 1000 characters per platform; Facebook accepts up to 5000 here."
+        ),
+    )
+    about: str | None = Field(
+        None,
+        max_length=255,
+        description="Facebook Page short About text. Facebook only.",
+    )
+    website: str | None = Field(
+        None,
+        max_length=2000,
+        description="Facebook Page website. Must be an http(s) URL. Facebook only.",
+    )
+    phone: str | None = Field(None, max_length=50, description="Facebook Page phone. Facebook only.")
+
+
+class AccountProfileResponse(Schema):
+    """What ``PATCH /accounts/{id}/profile`` changed on the platform."""
+
+    id: uuid.UUID
+    platform: str
+    transport: str | None = None
+    description: str | None = None
+    about: str | None = None
+    website: str | None = None
+    phone: str | None = None
+    updated_fields: list[str] = Field(
+        default_factory=list,
+        description="Fields the provider confirmed as updated.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +230,13 @@ class CreatePostRequest(Schema):
 
     ``social_account_id`` MUST be in the key's allowlist; the auth class
     raises 403 otherwise.
+
+    The YouTube-only fields (``privacy_status``, ``tags``,
+    ``thumbnail_asset_id``, ``category_id``, ``made_for_kids``) are
+    honoured only when the target account's destination platform is
+    YouTube; every other destination ignores them. All five are
+    optional — omitting them keeps the legacy behaviour (public, no
+    tags, no custom thumbnail, category ``"22"``, not made for kids).
     """
 
     social_account_id: uuid.UUID = Field(
@@ -206,6 +271,75 @@ class CreatePostRequest(Schema):
         default_factory=list,
         description="MediaAsset IDs already uploaded to the workspace's media library. Position-ordered.",
     )
+    # --- YouTube-only options (ignored for every other destination) ---
+    privacy_status: Literal["public", "unlisted", "private"] | None = Field(
+        None,
+        description=(
+            "YouTube privacy_status. Omitted → the provider default (public). "
+            "Via Zernio, 'unlisted' is delivered as private — Zernio has no unlisted visibility."
+        ),
+    )
+    tags: list[str] | None = Field(
+        None,
+        description=(
+            "YouTube video tags. At most 30 tags, each 1-50 characters after trimming, "
+            "500 characters total including separators (the YouTube Data API caps). "
+            "Duplicates are dropped, order kept. Omitted → no tags."
+        ),
+    )
+    thumbnail_asset_id: uuid.UUID | None = Field(
+        None,
+        description=(
+            "MediaAsset ID (image) in this workspace to upload as the YouTube custom thumbnail. "
+            "Must exist in the same workspace — otherwise 422. Ignored via Zernio "
+            "(Zernio has no thumbnail field). A failed thumbnail upload never fails "
+            "the video publish (provider behaviour)."
+        ),
+    )
+    category_id: str | None = Field(
+        None,
+        max_length=10,
+        pattern=r"^[0-9]+$",
+        description=(
+            'YouTube categoryId (numeric string, e.g. "22" = People & Blogs). '
+            'Omitted → provider default "22". Ignored via Zernio.'
+        ),
+    )
+    made_for_kids: bool | None = Field(
+        None,
+        description="YouTube selfDeclaredMadeForKids. Omitted → false. Ignored via Zernio.",
+    )
+
+    @field_validator("tags")
+    @classmethod
+    def _validate_youtube_tags(cls, value: list[str] | None) -> list[str] | None:
+        """Enforce YouTube's tag caps (same bounds as ``apps/common/validators.py``).
+
+        At most 30 tags, each 1-50 chars after trimming, 500 chars total
+        including separators. Blank entries are rejected; duplicates are
+        dropped, order kept. Violations raise ``ValueError`` → 422.
+        """
+        if value is None:
+            return None
+        if len(value) > 30:
+            raise ValueError("tags accepts at most 30 entries.")
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        total = 0
+        for raw in value:
+            tag = raw.strip()
+            if not tag:
+                raise ValueError("tags must not contain blank entries.")
+            if len(tag) > 50:
+                raise ValueError("each tag must be at most 50 characters.")
+            if tag in seen:
+                continue
+            total += len(tag) + (1 if cleaned else 0)
+            if total > 500:
+                raise ValueError("tags must total at most 500 characters including separators.")
+            seen.add(tag)
+            cleaned.append(tag)
+        return cleaned
     platform_overrides: list[PlatformOverride] = Field(
         default_factory=list,
         description=(
@@ -274,6 +408,7 @@ class PlatformPostSummary(Schema):
     id: uuid.UUID
     social_account_id: uuid.UUID
     platform: str
+    transport: str | None = None
     status: str
     scheduled_at: dt.datetime | None
     published_at: dt.datetime | None
@@ -289,7 +424,8 @@ class PlatformPostSummary(Schema):
         return cls(
             id=pp.id,
             social_account_id=pp.social_account_id,
-            platform=pp.social_account.platform,
+            platform=pp.social_account.display_platform,
+            transport=pp.social_account.transport,
             status=pp.status,
             scheduled_at=pp.scheduled_at,
             published_at=pp.published_at,
@@ -573,6 +709,14 @@ class AccountAnalyticsResponse(Schema):
 
     account_id: uuid.UUID
     platform: str
+    transport: str | None = Field(
+        None,
+        description=(
+            "Transport carrying publishes for this account: \"zernio\" when routed via Zernio, "
+            "null for a direct platform connection. ``platform`` is always the effective "
+            "destination platform (TikTok, YouTube, ...) — never the transport."
+        ),
+    )
     account_name: str
     connection_status: str = Field(
         ...,
@@ -646,6 +790,14 @@ class PlatformPostAnalyticsResponse(Schema):
     platform_post_id: uuid.UUID
     social_account_id: uuid.UUID
     platform: str
+    transport: str | None = Field(
+        None,
+        description=(
+            "Transport carrying publishes for this account: \"zernio\" when routed via Zernio, "
+            "null for a direct platform connection. ``platform`` is always the effective "
+            "destination platform (TikTok, YouTube, ...) — never the transport."
+        ),
+    )
     status: str
     published_at: dt.datetime | None
     analytics_available: bool = Field(
@@ -763,6 +915,14 @@ class InboxMessageResponse(Schema):
     workspace_id: uuid.UUID
     social_account_id: uuid.UUID
     platform: str
+    transport: str | None = Field(
+        None,
+        description=(
+            "Transport carrying replies for this account: \"zernio\" when routed via Zernio, "
+            "null for a direct platform connection. ``platform`` is always the effective "
+            "destination platform -- never the transport."
+        ),
+    )
     message_type: str
     status: str
     sentiment: str
@@ -797,7 +957,8 @@ class InboxMessageResponse(Schema):
             id=message.id,
             workspace_id=message.workspace_id,
             social_account_id=message.social_account_id,
-            platform=message.social_account.platform,
+            platform=message.social_account.display_platform,
+            transport=message.social_account.transport,
             message_type=message.message_type,
             status=message.status,
             sentiment=message.sentiment,
@@ -852,3 +1013,144 @@ class ErrorResponse(Schema):
     remaining: int | None = None
     retry_after: int | None = None
     reset_at: dt.datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# /live — YouTube Live broadcasts
+# ---------------------------------------------------------------------------
+
+LivePrivacyStatus = Literal["public", "unlisted", "private"]
+LiveResolution = Literal["2160p", "1080p", "720p", "480p", "360p", "240p", "144p"]
+LiveFrameRate = Literal["30fps", "60fps"]
+LiveTransitionAction = Literal["test", "go_live", "stop"]
+
+
+class LiveBroadcastCreateRequest(Schema):
+    social_account_id: uuid.UUID = Field(
+        ...,
+        description="A connected YouTube account in this key's allowlist (see GET /accounts/).",
+    )
+    title: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Broadcast title. Shown to viewers; also used as the ingest stream title.",
+    )
+    description: str = Field("", max_length=5000, description="Optional broadcast description.")
+    privacy_status: LivePrivacyStatus = Field(
+        "private",
+        description="Default private: nothing goes live until you transition it, and the VOD stays private.",
+    )
+    resolution: LiveResolution = Field("1080p", description="Ingest resolution.")
+    frame_rate: LiveFrameRate = Field("30fps", description="Ingest frame rate.")
+    scheduled_start: dt.datetime | None = Field(
+        None,
+        description="Optional scheduled start (ISO 8601). A tz-less value is read as UTC.",
+    )
+    idempotency_key: str | None = Field(
+        None,
+        max_length=128,
+        description="Optional client-chosen retry key. Same key + same body → replay first response.",
+    )
+
+
+class LiveTransitionRequest(Schema):
+    action: LiveTransitionAction = Field(
+        ...,
+        description="'test' → testing (preview), 'go_live' → live, 'stop' → complete.",
+    )
+    confirm: bool = Field(
+        False,
+        description=(
+            "Required when going live on a PUBLIC broadcast: pass true to confirm viewers "
+            "will be able to watch immediately. Private/unlisted broadcasts go live without it."
+        ),
+    )
+
+
+class LiveBroadcastResponse(Schema):
+    id: uuid.UUID
+    broadcast_id: str
+    stream_id: str
+    social_account_id: uuid.UUID
+    social_account_name: str
+    title: str
+    description: str
+    privacy_status: str
+    status: str
+    scheduled_start: dt.datetime | None
+    actual_start: dt.datetime | None
+    actual_end: dt.datetime | None
+    stream_status: str
+    health_status: str
+    viewers: int | None
+    uptime_seconds: int | None
+    watch_url: str
+    rtmps_url: str
+    masked_stream_key: str
+    stream_key: str | None = Field(
+        None,
+        description=(
+            "The full RTMP stream key — present ONLY in the create / recreate-stream response, "
+            "exactly once. Never returned by list/detail. Copy it into OBS immediately."
+        ),
+    )
+    key_shown: bool
+    last_error: str
+    last_checked_at: dt.datetime | None
+    created_at: dt.datetime
+    updated_at: dt.datetime
+
+    @field_serializer(
+        "scheduled_start", "actual_start", "actual_end", "last_checked_at", "created_at", "updated_at"
+    )
+    def _serialize_dt(self, value: dt.datetime | None) -> str | None:
+        return _serialize_utc_z(value)
+
+    @classmethod
+    def from_broadcast(cls, broadcast, *, stream_key: str | None = None) -> LiveBroadcastResponse:
+        """Single source of truth for LiveBroadcast → API response shape.
+
+        Used by both the REST router and MCP handlers so the two surfaces
+        cannot drift. ``stream_key`` is the full key, passed only by the
+        create / recreate responses that disclose it once.
+        """
+        return cls(
+            id=broadcast.id,
+            broadcast_id=broadcast.broadcast_id,
+            stream_id=broadcast.stream_id or "",
+            social_account_id=broadcast.social_account_id,
+            social_account_name=getattr(broadcast.social_account, "account_name", "") or "",
+            title=broadcast.title,
+            description=broadcast.description,
+            privacy_status=broadcast.privacy_status,
+            status=broadcast.status,
+            scheduled_start=broadcast.scheduled_start,
+            actual_start=broadcast.actual_start,
+            actual_end=broadcast.actual_end,
+            stream_status=broadcast.last_stream_status,
+            health_status=broadcast.last_health_status,
+            viewers=broadcast.last_viewers,
+            uptime_seconds=broadcast.uptime,
+            watch_url=broadcast.watch_url,
+            rtmps_url=rtmps_ingestion_url(broadcast.stream_url or ""),
+            masked_stream_key=broadcast.masked_stream_key,
+            stream_key=stream_key,
+            key_shown=broadcast.key_shown,
+            last_error=broadcast.last_error,
+            last_checked_at=broadcast.last_checked_at,
+            created_at=broadcast.created_at,
+            updated_at=broadcast.updated_at,
+        )
+
+
+class LiveBroadcastListResponse(Schema):
+    broadcasts: list[LiveBroadcastResponse]
+    limit: int
+    next_cursor: str | None = None
+
+
+class LiveDeleteResponse(Schema):
+    id: uuid.UUID
+    broadcast_id: str
+    deleted: bool = True
