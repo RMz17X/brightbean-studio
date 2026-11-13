@@ -297,6 +297,101 @@ class FacebookProvider(SocialProvider):
             )
         return pages
 
+    def update_page_info(
+        self,
+        access_token: str,
+        page_id: str,
+        *,
+        about: str | None = None,
+        description: str | None = None,
+        website: str | None = None,
+        phone: str | None = None,
+    ) -> dict:
+        """Update a Page's public info fields via ``POST /{page-id}``.
+
+        Only the fields actually given are sent -- a field left as ``None``
+        is left untouched on the Page, never cleared. The Page *name*
+        cannot be changed through the Graph API, so there is deliberately
+        no name parameter here.
+
+        Requires the Page access token to carry ``pages_manage_metadata``.
+        """
+        page_id = str(page_id or "").strip()
+        if not page_id:
+            raise APIError(
+                "page_id is required to update Facebook Page info",
+                platform=self.platform_name,
+                retryable=False,
+            )
+
+        fields: dict[str, str] = {}
+        for field_name, value in (
+            ("about", about),
+            ("description", description),
+            ("website", website),
+            ("phone", phone),
+        ):
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise APIError(
+                    f"Facebook Page {field_name} must be a non-empty string",
+                    platform=self.platform_name,
+                    retryable=False,
+                )
+            fields[field_name] = value.strip() if field_name == "website" else value
+
+        if not fields:
+            raise APIError(
+                "Nothing to update: pass at least one of about, description, website or phone",
+                platform=self.platform_name,
+                retryable=False,
+            )
+
+        website = fields.get("website")
+        if website is not None:
+            parsed = urlparse(website)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                raise APIError(
+                    "Facebook Page website must be an http(s) URL",
+                    platform=self.platform_name,
+                    retryable=False,
+                )
+
+        try:
+            resp = self._request(
+                "POST",
+                f"{BASE_URL}/{page_id}",
+                access_token=access_token,
+                json=fields,
+            )
+        except APIError as exc:
+            if exc.status_code == 403:
+                raise APIError(
+                    "Facebook refused the Page update (HTTP 403): the Page access "
+                    "token is missing the pages_manage_metadata permission, or the "
+                    f"token's user cannot manage this Page. Graph said: {exc}",
+                    status_code=403,
+                    platform=self.platform_name,
+                    raw_response=exc.raw_response,
+                    retryable=False,
+                ) from exc
+            raise
+        data = resp.json()
+        if data.get("success") is not True:
+            raise APIError(
+                "Facebook did not confirm the Page update",
+                platform=self.platform_name,
+                raw_response=data,
+                retryable=False,
+            )
+        return {
+            "page_id": page_id,
+            "updated_fields": sorted(fields),
+            "success": True,
+            "raw_response": data,
+        }
+
     # ------------------------------------------------------------------
     # Publishing
     # ------------------------------------------------------------------

@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 from django.conf import settings
 from django.contrib import admin
 from django.urls import include, path, re_path
+from django.views.generic import TemplateView
 from django.views.static import serve
 
 from apps.accounts.views import health_check
@@ -16,6 +17,10 @@ logger = logging.getLogger(__name__)
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("health/", health_check, name="health_check"),
+    # Public legal pages (Hijitoko Studio, local - no login required).
+    path("privacy/", TemplateView.as_view(template_name="legal/privacy.html"), name="privacy_policy"),
+    path("terms/", TemplateView.as_view(template_name="legal/terms.html"), name="terms_of_service"),
+    path("disclaimer/", TemplateView.as_view(template_name="legal/disclaimer.html"), name="disclaimer"),
     path("accounts/", include("apps.accounts.urls")),
     path("accounts/", include("allauth.urls")),
     path("organizations/", include("apps.organizations.urls")),
@@ -31,6 +36,11 @@ urlpatterns = [
     path("workspace/<uuid:workspace_id>/", include("apps.composer.urls")),
     path("workspace/<uuid:workspace_id>/calendar/", include("apps.calendar.urls")),
     path("workspace/<uuid:workspace_id>/inbox/", include("apps.inbox.urls")),
+    # YouTube Live monitor (local) — login + workspace membership required.
+    # Mounted before the analytics include so /live/ never falls through.
+    path("workspace/<uuid:workspace_id>/live/", include("apps.social_accounts.live_urls")),
+    # Zernio key pool + account connect (local) — same auth model as Live.
+    path("workspace/<uuid:workspace_id>/zernio/", include("apps.zernio.urls")),
     path("workspace/<uuid:workspace_id>/analytics/", include("apps.analytics.urls")),
     path("webhooks/", include("apps.inbox.webhook_urls")),
     path("webhooks/", include("apps.common.webhook_urls")),

@@ -54,6 +54,9 @@ class PlatformCredential(models.Model):
         GOOGLE_BUSINESS = "google_business", "Google Business Profile"
         MASTODON = "mastodon", "Mastodon"
         DEVTO = "devto", "DEV.to"
+        # Aggregator: accounts connect through the Zernio key pool, not
+        # OAuth (hidden from the connect grid by a PlatformVisibility row).
+        ZERNIO = "zernio", "Zernio"
 
     class TestResult(models.TextChoices):
         SUCCESS = "success", "Success"

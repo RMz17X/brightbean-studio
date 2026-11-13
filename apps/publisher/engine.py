@@ -105,6 +105,15 @@ def _resolve_publish_credentials(account):
             )
     elif platform == "facebook":
         credentials["page_id"] = account.account_platform_id
+    elif platform == "zernio":
+        # The API key comes from the account's key-pool binding, not from an
+        # org credential: the pool is the single source of truth, so a
+        # disabled/rebound key takes effect on the next publish with no
+        # per-account copy to chase. An unbound account yields {} and the
+        # provider refuses with a message that names the fix.
+        from apps.zernio.services import credentials_for_account
+
+        credentials.update(credentials_for_account(account))
     elif platform in ("instagram", "instagram_login"):
         credentials["ig_user_id"] = account.account_platform_id
         if platform == "instagram":
@@ -730,6 +739,11 @@ class PublishEngine:
         """
         account = platform_post.social_account
         platform = account.platform
+        # Raw platform stays the routing key ("zernio" selects the Zernio
+        # provider); the destination is what the options follow. The
+        # platform == "zernio" conjunct keeps mocked accounts in existing
+        # tests (which set a MagicMock is_via_zernio) from tripping this.
+        via_zernio = platform == "zernio" and bool(getattr(account, "is_via_zernio", False))
         attachments = list(platform_post.post.media_attachments.select_related("media_asset").order_by("position"))
 
         # Every scheduled row passes through here, however it was scheduled, so
@@ -743,7 +757,7 @@ class PublishEngine:
             platform_extra=platform_post.platform_extra,
         )
         if blocker:
-            raise PublishError(blocker, platform=account.get_platform_display(), retryable=False)
+            raise PublishError(blocker, platform=account.display_platform_label, retryable=False)
 
         # Refreshes an expiring token first — covers OAuth2 providers *and*
         # session providers like Bluesky, whose accessJwt expires after only a
@@ -829,9 +843,10 @@ class PublishEngine:
             link_url = extra.pop("link_url", None)
 
             # Resolve thumbnail_asset_id → temp file path for providers that
-            # need to upload a custom thumbnail (YouTube).
+            # need to upload a custom thumbnail (YouTube). Zernio has no
+            # thumbnail field, so don't download one for it.
             thumb_asset_id = extra.pop("thumbnail_asset_id", None)
-            if thumb_asset_id:
+            if thumb_asset_id and not via_zernio:
                 from apps.media_library.models import MediaAsset
 
                 try:
@@ -846,9 +861,10 @@ class PublishEngine:
                 except MediaAsset.DoesNotExist:
                     logger.warning("Thumbnail asset %s not found", thumb_asset_id)
 
-            # Resolve cover_image_asset_id → temp file (Pinterest video pins)
+            # Resolve cover_image_asset_id → temp file (Pinterest video pins).
+            # Zernio has no cover field, so don't download one for it.
             cover_asset_id = extra.pop("cover_image_asset_id", None)
-            if cover_asset_id:
+            if cover_asset_id and not via_zernio:
                 try:
                     cover_asset = MediaAsset.objects.get(id=cover_asset_id)
                     if cover_asset.file:
@@ -862,7 +878,11 @@ class PublishEngine:
                     logger.warning("Cover image asset %s not found", cover_asset_id)
 
             post_type = self._resolve_post_type(
-                platform=platform,
+                # Destination platform for Zernio rows (PIN / CAROUSEL /
+                # REEL defaults follow where the post lands); the Zernio
+                # provider ignores post_type today, but the resolved type
+                # is what gets logged.
+                platform=account.display_platform if via_zernio else platform,
                 platform_extra=platform_extra,
                 # Count attachments, NOT downloaded files: media_files is empty
                 # for URL-only providers, and counting it there would silently
@@ -1090,7 +1110,7 @@ class PublishEngine:
             author = platform_post.post.author
             if not author:
                 return
-            platform = platform_post.social_account.get_platform_display()
+            platform = platform_post.social_account.display_platform_label
             notify(
                 author,
                 EventType.POST_FAILED,
@@ -1099,7 +1119,8 @@ class PublishEngine:
                 data={
                     "post_id": str(platform_post.post_id),
                     "platform_post_id": str(platform_post.id),
-                    "platform": platform_post.social_account.platform,
+                    "platform": platform_post.social_account.display_platform,
+                    "transport": platform_post.social_account.transport,
                 },
             )
         except Exception:

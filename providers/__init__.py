@@ -24,6 +24,7 @@ from .threads import ThreadsProvider
 from .tiktok import TikTokProvider
 from .types import PostType
 from .youtube import YouTubeProvider
+from .zernio import ZernioProvider
 
 if TYPE_CHECKING:
     from .base import SocialProvider
@@ -42,6 +43,7 @@ PROVIDER_REGISTRY: dict[str, type[SocialProvider]] = {
     "google_business": GoogleBusinessProvider,
     "mastodon": MastodonProvider,
     "devto": DevtoProvider,
+    "zernio": ZernioProvider,
 }
 
 # Characters a platform escapes in the caption it publishes. Each one costs two

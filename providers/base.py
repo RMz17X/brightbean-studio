@@ -135,6 +135,14 @@ class SocialProvider(ABC):
     # from the requested scope list. Default True keeps backward compat.
     include_analytics_scopes: bool = True
 
+    # OAuth init can flip this to True to request a feature-gated scope that
+    # the regular connect flow must not ask for. Default False: a wider
+    # consent screen on every connect would force users through permissions
+    # — and the app through App Review — for a feature most workspaces never
+    # open. YouTube flips it on only for its Live re-authorize flow; see
+    # ``YouTubeProvider.required_scopes``.
+    include_live_scopes: bool = False
+
     # OAuth providers that require PKCE flip this to True. The connect view then
     # generates a code_verifier, stashes it in the session, sends the derived
     # code_challenge on the authorize URL, and replays the verifier on token
