@@ -1521,3 +1521,142 @@ def test_find_own_comment_falls_back_to_the_raw_id_like_publish_does():
 
     assert provider.find_own_comment("page-token", "video-1", "More detail") == "c-ours"
     assert provider._request.call_count == 2
+
+# ---------------------------------------------------------------------------
+# Page info update
+# ---------------------------------------------------------------------------
+
+
+def test_update_page_info_sends_only_the_given_fields():
+    """Only provided fields go to Graph -- None fields are left untouched, never cleared."""
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(return_value=_resp({"success": True}))
+
+    result = provider.update_page_info(
+        "page-token",
+        "page-1",
+        about="Tentang kami",
+        website="https://example.com",
+    )
+
+    assert result["page_id"] == "page-1"
+    assert result["updated_fields"] == ["about", "website"]
+    assert result["success"] is True
+    provider._request.assert_called_once_with(
+        "POST",
+        "https://graph.facebook.com/v25.0/page-1",
+        access_token="page-token",
+        json={"about": "Tentang kami", "website": "https://example.com"},
+    )
+    sent = provider._request.call_args.kwargs["json"]
+    assert "description" not in sent
+    assert "phone" not in sent
+    assert "name" not in sent
+
+
+def test_update_page_info_sends_all_four_fields():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(return_value=_resp({"success": True}))
+
+    result = provider.update_page_info(
+        "page-token",
+        "page-1",
+        about="Tentang",
+        description="Deskripsi panjang",
+        website="https://example.com",
+        phone="+62 812 3456 7890",
+    )
+
+    assert result["updated_fields"] == ["about", "description", "phone", "website"]
+    provider._request.assert_called_once_with(
+        "POST",
+        "https://graph.facebook.com/v25.0/page-1",
+        access_token="page-token",
+        json={
+            "about": "Tentang",
+            "description": "Deskripsi panjang",
+            "website": "https://example.com",
+            "phone": "+62 812 3456 7890",
+        },
+    )
+
+
+@pytest.mark.parametrize("website", ["www.example.com", "ftp://example.com", "https://"])
+def test_update_page_info_rejects_an_invalid_website_without_calling_the_api(website):
+    """A website that is not an http(s) URL fails locally -- no Graph call is made."""
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock()
+
+    with pytest.raises(APIError, match="http\\(s\\) URL"):
+        provider.update_page_info("page-token", "page-1", website=website)
+
+    provider._request.assert_not_called()
+
+
+def test_update_page_info_requires_at_least_one_field():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock()
+
+    with pytest.raises(APIError, match="Nothing to update"):
+        provider.update_page_info("page-token", "page-1")
+
+    provider._request.assert_not_called()
+
+
+def test_update_page_info_rejects_a_blank_field():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock()
+
+    with pytest.raises(APIError, match="non-empty string"):
+        provider.update_page_info("page-token", "page-1", about="   ")
+
+    provider._request.assert_not_called()
+
+
+def test_update_page_info_requires_a_page_id():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock()
+
+    with pytest.raises(APIError, match="page_id is required"):
+        provider.update_page_info("page-token", "  ", about="Tentang")
+
+    provider._request.assert_not_called()
+
+
+def test_update_page_info_maps_a_403_to_the_missing_permission():
+    """A 403 names pages_manage_metadata -- the one permission this call needs."""
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(
+        side_effect=APIError(
+            "Facebook API error 403: (#200) Requires pages_manage_metadata permission",
+            status_code=403,
+            platform="Facebook",
+            raw_response={"error": {"code": 200, "message": "(#200) Requires pages_manage_metadata permission"}},
+        )
+    )
+
+    with pytest.raises(APIError, match="pages_manage_metadata") as excinfo:
+        provider.update_page_info("page-token", "page-1", about="Tentang")
+
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.retryable is False
+
+
+def test_update_page_info_rejects_a_non_success_response():
+    """Graph answered 2xx without success=true -- the update is not confirmed."""
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(return_value=_resp({"success": False}))
+
+    with pytest.raises(APIError, match="did not confirm"):
+        provider.update_page_info("page-token", "page-1", about="Tentang")
+
+
+def test_update_page_info_has_no_name_parameter():
+    """A Page name cannot be changed via the Graph API -- the method must not accept one."""
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(return_value=_resp({"success": True}))
+
+    with pytest.raises(TypeError):
+        provider.update_page_info("page-token", "page-1", about="Tentang", name="Nama Baru")
+
+    provider._request.assert_not_called()

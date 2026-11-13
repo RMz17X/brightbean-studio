@@ -14,8 +14,11 @@ from providers.youtube import (
     _MAX_DEEP_COMMENT_PAGES,
     ANALYTICS_BASE,
     API_BASE,
+    MAX_CHANNEL_DESCRIPTION_LENGTH,
     UPLOAD_BASE,
     YouTubeProvider,
+    build_channel_description_body,
+    parse_channel_description,
 )
 
 
@@ -839,3 +842,268 @@ class TestQuotaUnitAccounting:
             provider.get_messages("tok")
 
         assert provider.last_call_quota_units == 1
+
+
+class TestBuildChannelDescriptionBody:
+    """The PUT body must carry the old branding back, not just the new text.
+
+    ``channels.update`` overwrites every property of the parts it carries,
+    so a body with only the description would wipe the channel's keywords,
+    trailer and banner. The builder is pure so the wire shape can be
+    pinned without mocking the transport, like the Live body builders.
+    """
+
+    _CHANNEL = {
+        "id": "UCtest123",
+        "brandingSettings": {
+            "channel": {
+                "title": "BeritaKenapa",
+                "description": "Deskripsi lama",
+                "keywords": "berita kenapa",
+                "unsubscribedTrailer": "vid123",
+            },
+            "image": {"bannerExternalUrl": "https://example.com/banner.jpg"},
+        },
+    }
+
+    def test_replaces_only_the_description(self):
+        body = build_channel_description_body(self._CHANNEL, "Deskripsi baru")
+
+        assert body == {
+            "id": "UCtest123",
+            "brandingSettings": {
+                "channel": {
+                    "title": "BeritaKenapa",
+                    "description": "Deskripsi baru",
+                    "keywords": "berita kenapa",
+                    "unsubscribedTrailer": "vid123",
+                },
+                "image": {"bannerExternalUrl": "https://example.com/banner.jpg"},
+            },
+        }
+
+    def test_does_not_mutate_the_fetched_channel(self):
+        channel = {
+            "id": "UCtest123",
+            "brandingSettings": {"channel": {"description": "Deskripsi lama"}},
+        }
+
+        build_channel_description_body(channel, "Deskripsi baru")
+
+        assert channel["brandingSettings"]["channel"]["description"] == "Deskripsi lama"
+
+    def test_channel_without_branding_settings_still_builds(self):
+        body = build_channel_description_body({"id": "UCtest123"}, "Deskripsi baru")
+
+        assert body == {
+            "id": "UCtest123",
+            "brandingSettings": {"channel": {"description": "Deskripsi baru"}},
+        }
+
+    def test_parse_reads_channel_id_and_description(self):
+        item = {
+            "id": "UCtest123",
+            "brandingSettings": {"channel": {"description": "Deskripsi baru"}},
+        }
+
+        assert parse_channel_description(item) == {
+            "channel_id": "UCtest123",
+            "description": "Deskripsi baru",
+        }
+
+
+class TestUpdateChannelDescription:
+    """GET the current branding, PUT it back with the new description."""
+
+    _CHANNEL = {
+        "id": "UCtest123",
+        "brandingSettings": {
+            "channel": {
+                "title": "BeritaKenapa",
+                "description": "Deskripsi lama",
+                "keywords": "berita kenapa",
+            },
+            "image": {"bannerExternalUrl": "https://example.com/banner.jpg"},
+        },
+    }
+
+    @staticmethod
+    def _scope_error(reason: str = "insufficientPermissions") -> APIError:
+        return APIError(
+            "YouTube API error 403: forbidden",
+            status_code=403,
+            platform="YouTube",
+            raw_response={
+                "error": {
+                    "code": 403,
+                    "message": "The request cannot be completed because you do not have sufficient permissions for this operation.",
+                    "errors": [{"reason": reason, "domain": "youtube.channel"}],
+                }
+            },
+        )
+
+    def _mock_get_put(self, mock_request, *, description: str = "Deskripsi baru"):
+        mock_request.side_effect = [
+            _make_response({"items": [self._CHANNEL]}),
+            _make_response(
+                {
+                    "id": "UCtest123",
+                    "brandingSettings": {"channel": {"description": description}},
+                }
+            ),
+        ]
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_success_get_then_put_preserves_branding(self, mock_request):
+        self._mock_get_put(mock_request)
+        provider = YouTubeProvider()
+
+        result = provider.update_channel_description("token-xyz", "Deskripsi baru")
+
+        assert mock_request.call_count == 2
+        get_args, get_kwargs = mock_request.call_args_list[0]
+        assert get_args[0] == "GET"
+        assert get_args[1] == f"{API_BASE}/channels"
+        assert get_kwargs["access_token"] == "token-xyz"
+        assert get_kwargs["params"] == {"part": "brandingSettings", "mine": "true"}
+        put_args, put_kwargs = mock_request.call_args_list[1]
+        assert put_args[0] == "PUT"
+        assert put_args[1] == f"{API_BASE}/channels"
+        assert put_kwargs["params"] == {"part": "brandingSettings"}
+        # The old branding rides along; only the description changes.
+        assert put_kwargs["json"] == {
+            "id": "UCtest123",
+            "brandingSettings": {
+                "channel": {
+                    "title": "BeritaKenapa",
+                    "description": "Deskripsi baru",
+                    "keywords": "berita kenapa",
+                },
+                "image": {"bannerExternalUrl": "https://example.com/banner.jpg"},
+            },
+        }
+        assert result == {"channel_id": "UCtest123", "description": "Deskripsi baru"}
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_explicit_channel_id_uses_id_param(self, mock_request):
+        self._mock_get_put(mock_request)
+        provider = YouTubeProvider()
+
+        provider.update_channel_description("token-xyz", "Deskripsi baru", channel_id="UCtest123")
+
+        get_kwargs = mock_request.call_args_list[0].kwargs
+        assert get_kwargs["params"] == {"part": "brandingSettings", "id": "UCtest123"}
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_1000_characters_is_allowed(self, mock_request):
+        self._mock_get_put(mock_request, description="x" * 1000)
+        provider = YouTubeProvider()
+
+        result = provider.update_channel_description("token-xyz", "x" * 1000)
+
+        assert mock_request.call_count == 2
+        assert result["description"] == "x" * 1000
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_1001_characters_rejected_without_any_api_call(self, mock_request):
+        provider = YouTubeProvider()
+
+        with pytest.raises(ValueError, match="at most 1000"):
+            provider.update_channel_description("token-xyz", "x" * 1001)
+
+        mock_request.assert_not_called()
+        assert MAX_CHANNEL_DESCRIPTION_LENGTH == 1000
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_empty_description_clears_it(self, mock_request):
+        self._mock_get_put(mock_request, description="")
+        provider = YouTubeProvider()
+
+        result = provider.update_channel_description("token-xyz", "")
+
+        put_body = mock_request.call_args_list[1].kwargs["json"]
+        assert put_body["brandingSettings"]["channel"]["description"] == ""
+        assert result == {"channel_id": "UCtest123", "description": ""}
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_non_string_description_rejected_without_any_api_call(self, mock_request):
+        provider = YouTubeProvider()
+
+        with pytest.raises(ValueError, match="must be a string"):
+            provider.update_channel_description("token-xyz", None)  # type: ignore[arg-type]
+
+        mock_request.assert_not_called()
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_no_channel_found_raises_and_never_puts(self, mock_request):
+        mock_request.return_value = _make_response({"items": []})
+        provider = YouTubeProvider()
+
+        with pytest.raises(APIError, match="no channel"):
+            provider.update_channel_description("token-xyz", "Deskripsi baru")
+
+        assert mock_request.call_count == 1
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_403_insufficient_scope_on_get_names_the_reauthorize_fix(self, mock_request):
+        from apps.analytics.tasks import _is_insufficient_scope
+
+        mock_request.side_effect = self._scope_error()
+        provider = YouTubeProvider()
+
+        with pytest.raises(APIError) as exc_info:
+            provider.update_channel_description("token-xyz", "Deskripsi baru")
+
+        # The task's wording, verbatim: no raw Google error reaches the user.
+        assert "butuh re-authorize dengan scope penuh (YouTube)" in str(exc_info.value)
+        assert "Reconnect for Live" in str(exc_info.value)
+        assert exc_info.value.status_code == 403
+        # A missing scope never appears on retry, so the engine must not retry.
+        assert exc_info.value.retryable is False
+        # The analytics reconnect detector still recognises it as a scope error.
+        assert _is_insufficient_scope(exc_info.value)
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_403_insufficient_scope_on_put_names_the_reauthorize_fix(self, mock_request):
+        mock_request.side_effect = [
+            _make_response({"items": [self._CHANNEL]}),
+            self._scope_error(),
+        ]
+        provider = YouTubeProvider()
+
+        with pytest.raises(APIError) as exc_info:
+            provider.update_channel_description("token-xyz", "Deskripsi baru")
+
+        assert "butuh re-authorize dengan scope penuh (YouTube)" in str(exc_info.value)
+        assert mock_request.call_count == 2
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_403_forbidden_spelling_is_the_same_scope_refusal(self, mock_request):
+        mock_request.side_effect = self._scope_error(reason="forbidden")
+        provider = YouTubeProvider()
+
+        with pytest.raises(APIError) as exc_info:
+            provider.update_channel_description("token-xyz", "Deskripsi baru")
+
+        assert "butuh re-authorize dengan scope penuh (YouTube)" in str(exc_info.value)
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_403_for_another_reason_passes_through_unchanged(self, mock_request):
+        original = APIError(
+            "YouTube API error 403: access not configured",
+            status_code=403,
+            platform="YouTube",
+            raw_response={
+                "error": {
+                    "code": 403,
+                    "errors": [{"reason": "accessNotConfigured", "domain": "usageLimits"}],
+                }
+            },
+        )
+        mock_request.side_effect = original
+        provider = YouTubeProvider()
+
+        with pytest.raises(APIError) as exc_info:
+            provider.update_channel_description("token-xyz", "Deskripsi baru")
+
+        assert exc_info.value is original

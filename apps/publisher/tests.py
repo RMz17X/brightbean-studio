@@ -871,3 +871,41 @@ class ProviderUploadCacheTest(SimpleTestCase):
 
         self.assertIsNone(_provider_upload_cache.get("k"))
         _provider_upload_cache.set("k", "v", 60)
+
+
+class ZernioDispatchParityTest(SimpleTestCase):
+    """_dispatch_to_provider passes composer options through for Zernio rows.
+
+    The engine already merges platform_extra into the content for every
+    provider; this pins that a Zernio-YouTube row keeps its privacy/tags
+    while the dead thumbnail id is popped and never resolved to a file
+    (Zernio has no thumbnail field, so the engine must not download one).
+    """
+
+    @patch("apps.publisher.engine.publish_blocker", return_value="")
+    @patch("apps.publisher.engine.get_provider")
+    @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
+    def test_zernio_youtube_extras_pass_through_without_thumbnail_download(
+        self, _mock_creds, mock_get_provider, _mock_blocker
+    ):
+        engine, platform_post, mock_provider = _build_dispatch_mocks(
+            platform="zernio",
+            account_platform_id="z-yt",
+            platform_extra={
+                "privacy_status": "unlisted",
+                "tags": ["berita"],
+                "thumbnail_asset_id": "00000000-0000-0000-0000-000000000000",
+            },
+        )
+        platform_post.social_account.is_via_zernio = True
+        platform_post.social_account.display_platform = "youtube"
+        mock_get_provider.return_value = mock_provider
+
+        engine._dispatch_to_provider(platform_post)
+
+        mock_provider.publish_post.assert_called_once()
+        _access_token, content = mock_provider.publish_post.call_args.args
+        assert content.extra.get("privacy_status") == "unlisted"
+        assert content.extra.get("tags") == ["berita"]
+        assert "thumbnail_asset_id" not in content.extra
+        assert "thumbnail_file" not in content.extra
