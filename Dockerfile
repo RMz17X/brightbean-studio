@@ -11,8 +11,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js for Tailwind build
+# LOCAL PATCH (2026-11-12): guarantee `npm` exists after the install.
+# Upstream installs only `nodejs`, which bundles npm when the NodeSource
+# repo is reachable — but when it is not, apt falls back to Debian's
+# `nodejs`, which splits npm into a separate package, and the Tailwind
+# build then fails with "npm: not found" (hit 2026-11-12). NOTE: do NOT
+# just add `npm` to the install list — NodeSource's `nodejs` package
+# Conflicts with Debian's `npm` and apt then refuses both (hit 2026-11-12
+# on the first attempt at this patch). Install Debian's npm only when the
+# bundled one is missing.
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
+    && (command -v npm || apt-get install -y npm) \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

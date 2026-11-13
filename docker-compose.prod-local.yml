@@ -1,0 +1,23 @@
+# Local deployment overlay for bean.hijitoko.com (NOT upstream).
+# - Ports: app 18080 (8000/5432 already used on this host), postgres loopback-only.
+# - Bind-mounts repo into app/worker/migrate so local template/code patches
+#   apply on container restart without an image rebuild (gunicorn reloads
+#   templates per worker restart; Django caches templates in-process).
+# - Caddy service from docker-compose.prod.yml is NOT started: TLS terminates
+#   at Cloudflare Tunnel, origin is plain HTTP on localhost:18080.
+# Start with: docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.prod-local.yml up -d app worker postgres
+services:
+  migrate:
+    volumes:
+      - .:/app
+  app:
+    ports: !override
+      - 18080:8000
+    volumes:
+      - .:/app
+  worker:
+    volumes:
+      - .:/app
+  postgres:
+    ports: !override
+      - 127.0.0.1:15432:5432
