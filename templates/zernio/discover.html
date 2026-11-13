@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}Discover Zernio accounts | Hijitoko Studio{% endblock %}
+{% block page_title %}Zernio{% endblock %}
+{% block content %}
+<div class="max-w-5xl mx-auto space-y-6">
+
+    <div>
+        <a href="{% url 'zernio:dashboard' workspace_id=workspace_id %}" class="text-xs text-orange-600 hover:underline">← Back to Zernio keys</a>
+        <h1 class="text-lg font-semibold text-stone-900 mt-2">Accounts under key {{ key.display_name }}</h1>
+        <p class="text-sm text-stone-500 mt-1"><code class="bg-stone-100 px-1.5 py-0.5 rounded">{{ key.masked_key }}</code> · {{ key.slots_used }}/2 slots used{% if key.status == 'full' %} · this key is full — new accounts will roll over to another key with a free slot{% endif %}</p>
+    </div>
+
+    {% if messages %}
+    <div class="space-y-2">
+        {% for message in messages %}
+        <div class="rounded-xl px-5 py-3 text-sm {% if message.tags == 'error' %}bg-red-50 border border-red-200 text-red-800{% elif message.tags == 'warning' %}bg-amber-50 border border-amber-200 text-amber-800{% else %}bg-emerald-50 border border-emerald-200 text-emerald-800{% endif %}">{{ message }}</div>
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if accounts %}
+    <div class="bg-white border border-stone-200 rounded-xl p-6">
+        <table class="w-full text-sm">
+            <thead>
+                <tr class="text-left text-xs text-stone-400 border-b border-stone-200">
+                    <th class="py-2 pr-3 font-medium">Platform</th>
+                    <th class="py-2 pr-3 font-medium">Account</th>
+                    <th class="py-2 pr-3 font-medium">Status</th>
+                    <th class="py-2 font-medium"></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for account in accounts %}
+                <tr class="border-b border-stone-100">
+                    <td class="py-2 pr-3 font-medium text-stone-900"><span class="inline-flex items-center gap-1.5">{% if account.platform != "youtube" %}{% include "partials/_platform_icon.html" with platform=account.platform size="sm" %}{% endif %}{{ account.platform_label|default:account.platform }}</span></td>
+                    <td class="py-2 pr-3 text-stone-500">{{ account.display_name }}{% if account.username %} <span class="text-stone-400">({{ account.username }})</span>{% endif %}</td>
+                    <td class="py-2 pr-3 text-stone-500">{% if account.is_active %}Active{% else %}Inactive{% endif %}</td>
+                    <td class="py-2 text-right">
+                        {% if account.already_connected %}
+                        <span class="text-xs text-stone-400">Already connected</span>
+                        {% elif not account.is_active %}
+                        <span class="text-xs text-stone-400">Inactive at Zernio</span>
+                        {% else %}
+                        <form method="post" action="{% url 'zernio:connect_account' workspace_id=workspace_id %}">{% csrf_token %}
+                            <input type="hidden" name="key_id" value="{{ key.id }}">
+                            <input type="hidden" name="account_id" value="{{ account.account_id }}">
+                            <input type="hidden" name="platform" value="{{ account.platform }}">
+                            <input type="hidden" name="username" value="{{ account.username }}">
+                            <input type="hidden" name="display_name" value="{{ account.display_name }}">
+                            <input type="hidden" name="profile_id" value="{{ account.profile_id }}">
+                            <button type="submit" class="px-3 py-1.5 text-xs font-semibold text-white bg-orange-600 rounded-full hover:bg-orange-700">Connect</button>
+                        </form>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <p class="text-xs text-stone-400 mt-3">Connecting binds the account to a key with a free slot (this key first, if it has room). A connected account can be used for posts like any other account.</p>
+    </div>
+    {% else %}
+    <div class="bg-white border border-stone-200 rounded-xl p-6">
+        <h2 class="text-sm font-semibold text-stone-900">No accounts under this key</h2>
+        <p class="text-sm text-stone-500 mt-1">Connect social accounts to this Zernio profile at zernio.com first, then come back and discover again.</p>
+    </div>
+    {% endif %}
+
+</div>
+{% endblock %}

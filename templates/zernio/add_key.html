@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Tambah API key Zernio | Hijitoko Studio{% endblock %}
+{% block page_title %}Zernio{% endblock %}
+{% block content %}
+<div class="max-w-5xl mx-auto space-y-6">
+
+    <div>
+        <a href="{% url 'zernio:dashboard' workspace_id=workspace_id %}" class="text-xs text-orange-600 hover:underline">← Kembali ke dashboard</a>
+        <h1 class="text-lg font-semibold text-stone-900 mt-2">Tambah API key Zernio</h1>
+        <p class="text-sm text-stone-500 mt-1">Tambahkan satu API key Zernio ke pool workspace ini. Setiap key menampung maksimal <strong>2 akun</strong>.</p>
+    </div>
+
+    {% if messages %}
+    <div class="space-y-2">
+        {% for message in messages %}
+        <div class="rounded-xl px-5 py-3 text-sm {% if message.tags == 'error' %}bg-red-50 border border-red-200 text-red-800{% elif message.tags == 'warning' %}bg-amber-50 border border-amber-200 text-amber-800{% else %}bg-emerald-50 border border-emerald-200 text-emerald-800{% endif %}">{{ message }}</div>
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    <div class="bg-white border border-stone-200 rounded-xl p-6">
+        <h2 class="text-sm font-semibold text-stone-900">Status pool</h2>
+        <p class="text-sm text-stone-500 mt-1">{{ total_keys }} key · {{ slots_used }}/{{ total_slots }} slot terpakai · {{ slots_free }} slot bebas</p>
+        {% if keys %}
+        <ul class="mt-3 space-y-1 text-sm text-stone-500">
+            {% for key in keys %}
+            <li>{{ key.display_name }} · <code class="bg-stone-100 px-1.5 py-0.5 rounded">{{ key.masked_key }}</code> · {{ key.slots_used }}/2 akun</li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p class="text-sm text-stone-500 mt-1">Belum ada key di pool ini.</p>
+        {% endif %}
+    </div>
+
+    <div class="bg-white border border-stone-200 rounded-xl p-6">
+        <h2 class="text-sm font-semibold text-stone-900">Tambah API key</h2>
+        <p class="text-xs text-stone-500 mt-1">Buat key di <strong>zernio.com → API keys → Create API key</strong>, lalu tempel di bawah sebagai <code class="bg-stone-100 px-1 py-0.5 rounded">email|apikey</code> — email login Zernio, lalu <code>|</code>, lalu key-nya (<code class="bg-stone-100 px-1 py-0.5 rounded">sk_</code> diikuti 64 karakter hex). Zernio hanya menampilkan key sekali saat dibuat — salin sekarang, karena setelah disimpan di sini kamu hanya akan melihat 4 karakter terakhirnya lagi.</p>
+        <h3 class="text-sm font-semibold text-stone-900 mt-4">Apa yang terjadi setelahnya?</h3>
+        <ul class="text-sm text-stone-500 mt-1 space-y-1 list-disc list-inside">
+            <li>Key diuji ke Zernio (read-only) sebelum disimpan.</li>
+            <li>Kalau lolos, akun-akun di bawah key itu langsung dicari (auto-discover) dan kamu diarahkan ke halaman Discover.</li>
+            <li>Connect tetap manual per akun — pilih sendiri akun mana yang dipakai.</li>
+        </ul>
+        <form method="post" action="{% url 'zernio:add_key' workspace_id=workspace_id %}" class="mt-4 space-y-4">
+            {% csrf_token %}
+            <div>
+                <label for="key_identity" class="block text-xs font-medium text-stone-700 mb-1">Email + API key</label>
+                <input id="key_identity" name="key_identity" type="text" autocomplete="off" required class="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono" placeholder="nama@email.com|sk_...">
+                <p class="text-xs text-stone-500 mt-1">Satu baris: email login Zernio, lalu <code class="bg-stone-100 px-1 py-0.5 rounded">|</code>, lalu API key. Email dipakai sebagai identitas key ini — Zernio tidak mengembalikan email pemilik key, jadi email tidak diverifikasi ke Zernio.</p>
+            </div>
+            <div class="flex items-center gap-3 flex-wrap">
+                <button type="submit" class="inline-flex items-center px-4 py-2 text-xs font-semibold text-white bg-orange-600 rounded-full hover:bg-orange-700">Test &amp; simpan key</button>
+                <a href="{% url 'zernio:dashboard' workspace_id=workspace_id %}" class="text-xs font-semibold text-stone-600 hover:underline">Kembali ke dashboard</a>
+            </div>
+        </form>
+    </div>
+
+</div>
+{% endblock %}
