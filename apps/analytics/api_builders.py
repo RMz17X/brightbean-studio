@@ -52,7 +52,8 @@ def build_account_analytics(account: SocialAccount, days: int) -> AccountAnalyti
     if reason is not None:
         return AccountAnalyticsResponse(
             account_id=account.id,
-            platform=account.platform,
+            platform=account.display_platform,
+            transport=account.transport,
             account_name=account.account_name,
             connection_status=account.connection_status,
             days=days,
@@ -100,7 +101,8 @@ def build_account_analytics(account: SocialAccount, days: int) -> AccountAnalyti
 
     return AccountAnalyticsResponse(
         account_id=account.id,
-        platform=account.platform,
+        platform=account.display_platform,
+        transport=account.transport,
         account_name=account.account_name,
         connection_status=account.connection_status,
         days=days,
@@ -150,7 +152,8 @@ def _build_platform_post_analytics(platform_post, enabled_platforms: list[str]) 
         return PlatformPostAnalyticsResponse(
             platform_post_id=platform_post.id,
             social_account_id=account.id,
-            platform=account.platform,
+            platform=account.display_platform,
+            transport=account.transport,
             status=platform_post.status,
             published_at=platform_post.published_at,
             analytics_available=False,
@@ -163,7 +166,8 @@ def _build_platform_post_analytics(platform_post, enabled_platforms: list[str]) 
         return PlatformPostAnalyticsResponse(
             platform_post_id=platform_post.id,
             social_account_id=account.id,
-            platform=account.platform,
+            platform=account.display_platform,
+            transport=account.transport,
             status=platform_post.status,
             published_at=None,
             analytics_available=True,
@@ -194,7 +198,8 @@ def _build_platform_post_analytics(platform_post, enabled_platforms: list[str]) 
     return PlatformPostAnalyticsResponse(
         platform_post_id=platform_post.id,
         social_account_id=account.id,
-        platform=account.platform,
+        platform=account.display_platform,
+            transport=account.transport,
         status=platform_post.status,
         published_at=platform_post.published_at,
         analytics_available=True,

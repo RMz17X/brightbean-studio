@@ -11,7 +11,7 @@ Usage: {% include "social_accounts/partials/_account_card.html" with account=acc
             <img src="{{ account.avatar_url }}" alt="{{ account.account_name|default:account.account_handle }}" class="w-11 h-11 rounded-full object-cover ring-2 ring-stone-100">
             {% else %}
             <div class="w-11 h-11 rounded-full bg-stone-100 flex items-center justify-center text-stone-400">
-                {% if account.platform == "youtube" %}<span class="font-semibold">{{ account.account_name|default:account.account_handle|make_list|first|upper }}</span>{% else %}{% include "social_accounts/partials/_platform_icon.html" with platform=account.platform size="5" %}{% endif %}
+                {% if account.display_platform == "youtube" %}<span class="font-semibold">{{ account.account_name|default:account.account_handle|make_list|first|upper }}</span>{% else %}{% include "social_accounts/partials/_platform_icon.html" with platform=account.display_platform size="5" %}{% endif %}
             </div>
             {% endif %}
         </div>
@@ -21,7 +21,7 @@ Usage: {% include "social_accounts/partials/_account_card.html" with account=acc
             <div class="flex items-center gap-2 mb-1">
                 <h3 class="text-sm font-semibold text-stone-900 truncate">{{ account.account_name|default:account.account_handle }}</h3>
                 <span class="flex-shrink-0 text-stone-400">
-                    {% if account.platform == "youtube" %}<a href="https://www.youtube.com/channel/{{ account.account_platform_id|urlencode }}" target="_blank" rel="noopener noreferrer" class="text-xs font-medium text-stone-500 underline underline-offset-2">YouTube</a>{% else %}{% include "social_accounts/partials/_platform_icon.html" with platform=account.platform size="4" %}{% endif %}
+                    {% if account.platform == "youtube" %}<a href="https://www.youtube.com/channel/{{ account.account_platform_id|urlencode }}" target="_blank" rel="noopener noreferrer" class="text-xs font-medium text-stone-500 underline underline-offset-2">YouTube</a>{% elif account.display_platform == "youtube" %}<span class="text-xs font-medium text-stone-500">YouTube</span>{% else %}{% include "social_accounts/partials/_platform_icon.html" with platform=account.display_platform size="4" %} <span class="text-xs font-medium text-stone-500">{{ account.display_platform_label }}</span>{% endif %}{% if account.is_via_zernio %} <span class="text-[10px] font-semibold text-stone-400 bg-stone-100 rounded-full px-1.5 py-0.5">via Zernio</span>{% endif %}
                 </span>
             </div>
             {% if account.account_handle %}
@@ -30,7 +30,7 @@ Usage: {% include "social_accounts/partials/_account_card.html" with account=acc
             <div class="flex items-center gap-3 mt-2">
                 {% include "social_accounts/partials/_status_badge.html" with status=account.connection_status error=account.last_error %}
                 {% if account.follower_count %}
-                <span class="text-xs text-stone-400">{{ account.follower_count|format_number }} {% if account.platform == "youtube" %}subscribers{% else %}followers{% endif %}</span>
+                <span class="text-xs text-stone-400">{{ account.follower_count|format_number }} {% if account.display_platform == "youtube" %}subscribers{% else %}followers{% endif %}</span>
                 {% endif %}
             </div>
         </div>
@@ -69,9 +69,12 @@ Usage: {% include "social_accounts/partials/_account_card.html" with account=acc
                     {% elif account.keeps_platform_grant_on_disconnect %}
                     This removes the account from BrightBean only. To revoke our access entirely,
                     remove BrightBean in Facebook &rsaquo; Settings &rsaquo; Apps and Websites.
+                    {% elif account.is_via_zernio %}
+                    This removes the account from BrightBean only. To revoke our access entirely,
+                    remove the account at zernio.com.
                     {% else %}
                     This removes the account from BrightBean only. To revoke our access entirely,
-                    remove BrightBean in your {{ account.get_platform_display }} settings.
+                    remove BrightBean in your {{ account.display_platform_label }} settings.
                     {% endif %}
                 </p>
                 <p class="text-xs text-stone-500 mb-3">
@@ -187,6 +190,13 @@ Usage: {% include "social_accounts/partials/_account_card.html" with account=acc
     </div>
     {% endif %}
     {% endwith %}
+
+    {% comment %}
+    Public-profile edit: only the fields the destination platform can
+    actually update (see _profile_form.html). Platforms without an
+    update endpoint get a note, not a dead form.
+    {% endcomment %}
+    {% include "social_accounts/partials/_profile_form.html" with account=account workspace_id=workspace_id %}
 
     <!-- Posting Schedule -->
     {% if account.connection_status == "connected" %}

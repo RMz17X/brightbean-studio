@@ -21,4 +21,9 @@ NO_ANALYTICS_PLATFORMS: dict[str, str] = {
     # AnalyticsPlatformConfig: a missing config row now reads as *enabled*, and
     # this is a capability gap, not an admin decision.
     "devto": ("Publishing to DEV.to is supported, but its analytics aren't wired up yet."),
+    # Zernio carries accounts but exposes no analytics API of its own, so
+    # insights can never come back through it — regardless of destination.
+    # Publishing works; the account page says so instead of waiting forever
+    # for a first sync that cannot arrive.
+    "zernio": ("Zernio doesn't expose analytics for the accounts it carries. Publishing works; insights don't come back through Zernio."),
 }

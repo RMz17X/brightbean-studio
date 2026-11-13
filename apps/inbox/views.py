@@ -249,7 +249,7 @@ def send_reply(request, workspace_id, message_id):
             request,
             "inbox/partials/_reply_error.html",
             {
-                "platform_label": account.get_platform_display(),
+                "platform_label": account.display_platform_label,
                 "reason": inbox_services.reply_failure_reason(exc),
             },
         )

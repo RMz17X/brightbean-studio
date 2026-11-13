@@ -17,7 +17,10 @@ def me(request):
     enforce_http_rate_limits(request, is_write=False)
     api_key = request.api_key
     workspace = request.workspace
-    accounts = [AccountSummary.from_social_account(sa) for sa in api_key.social_accounts.all()]
+    accounts = [
+        AccountSummary.from_social_account(sa)
+        for sa in api_key.social_accounts.prefetch_related("zernio_binding").all()
+    ]
 
     organization = workspace.organization
     quota = resolve_storage_quota(organization)

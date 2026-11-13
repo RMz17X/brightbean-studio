@@ -13,12 +13,12 @@
     {% for account in accounts %}
     <div class="bg-white border border-stone-200 rounded-xl mb-4 overflow-hidden">
         <div class="px-5 py-3 border-b border-stone-100 flex items-center gap-3">
-            <span class="platform-icon pi-{{ account.platform }} w-7 h-7 text-[10px] rounded-lg">
+            <span class="platform-icon pi-{{ account.display_platform }} w-7 h-7 text-[10px] rounded-lg">
                 {{ account.platform_icon|upper }}
             </span>
             <div>
                 <div class="text-sm font-semibold text-stone-800">{{ account.account_name|default:account.account_handle }}</div>
-                <div class="text-xs text-stone-400">{{ account.get_platform_display }}</div>
+                <div class="text-xs text-stone-400">{{ account.display_platform_label }}</div>
             </div>
         </div>
         <div class="p-5">

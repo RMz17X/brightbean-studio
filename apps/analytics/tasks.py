@@ -133,6 +133,10 @@ BACKFILL_DAYS_PER_PLATFORM: dict[str, int] = {
     "mastodon": 0,
     "linkedin_personal": 0,
     "devto": 0,
+    # Zernio has no analytics API of its own: a zernio-routed account (whose
+    # raw platform is "zernio") must never get a backfill window, whatever
+    # its destination is. Pairs with NO_ANALYTICS_PLATFORMS["zernio"].
+    "zernio": 0,
 }
 DEFAULT_BACKFILL_DAYS = 90
 

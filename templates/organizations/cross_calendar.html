@@ -187,7 +187,7 @@
                         @change="window.location.href='?view={{ view_type }}&date={{ target_date|date:'Y-m-d' }}{% for sid in selected_workspace_ids %}&workspace={{ sid }}{% endfor %}{% if request.GET.status %}&status={{ request.GET.status }}{% endif %}{% if request.GET.tag %}&tag={{ request.GET.tag }}{% endif %}' + ($event.target.value ? '&channel=' + $event.target.value : '')">
                     <option value="">Channels</option>
                     {% for acc in social_accounts %}
-                    <option value="{{ acc.id }}" {% if request.GET.channel == acc.id|stringformat:'s' %}selected{% endif %}>{{ acc.account_name|default:acc.account_handle }} ({{ acc.get_platform_display }})</option>
+                    <option value="{{ acc.id }}" {% if request.GET.channel == acc.id|stringformat:'s' %}selected{% endif %}>{{ acc.account_name|default:acc.account_handle }} ({{ acc.display_platform_label }})</option>
                     {% endfor %}
                 </select>
             </div>
@@ -281,8 +281,8 @@
                        class="cross-post-chip status-{{ pp.status }}"
                        title="{{ pp.post.workspace.name }}: {{ pp.post.caption_snippet }}">
                         <span class="ws-dot" style="background: {{ pp.post.workspace.primary_color|default:'#F97316' }};"></span>
-                        <span class="w-4 h-4 rounded flex items-center justify-center pi-{{ pp.social_account.platform }} flex-shrink-0 text-white">
-                            {% include "social_accounts/partials/_platform_icon.html" with platform=pp.social_account.platform size="3" %}
+                        <span class="w-4 h-4 rounded flex items-center justify-center pi-{{ pp.social_account.display_platform }} flex-shrink-0 text-white">
+                            {% include "social_accounts/partials/_platform_icon.html" with platform=pp.social_account.display_platform size="3" %}
                         </span>
                         {% with first_media=pp.post.media_attachments.all.0 %}
                         {% if first_media and first_media.media_asset.thumbnail %}

@@ -16,7 +16,7 @@
     <!-- Platform icon -->
     {% if message.social_account.platform != "youtube" %}
     <div class="flex-shrink-0 pt-0.5">
-        {% include "partials/_platform_icon.html" with platform=message.social_account.platform size="sm" %}
+        {% include "partials/_platform_icon.html" with platform=message.social_account.display_platform size="sm" %}
     </div>
     {% endif %}
 

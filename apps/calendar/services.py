@@ -438,7 +438,7 @@ def repair_future_published_scheduled_at(*, workspace_id=None, apply=True):
                 "platform_post_id": str(pp.id),
                 "post_id": str(pp.post_id),
                 "workspace_id": str(pp.post.workspace_id),
-                "platform": pp.social_account.platform,
+                "platform": pp.social_account.display_platform,
                 "account": pp.social_account.account_name or pp.social_account.account_handle,
                 "old_scheduled_at": pp.scheduled_at,
                 "new_scheduled_at": pp.published_at,

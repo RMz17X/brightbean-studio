@@ -54,6 +54,10 @@ class AuthType(enum.Enum):
     OAUTH2 = "oauth2"
     SESSION = "session"
     INSTANCE_OAUTH = "instance_oauth"
+    # API-key auth (Zernio): the key is supplied by the operator, there is
+    # no per-user grant and no authorize URL. Platforms with this type are
+    # never offered on the OAuth connect grid.
+    API_KEY = "api_key"
 
 
 @dataclass(frozen=True)

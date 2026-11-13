@@ -122,7 +122,11 @@ class InboxMessage(models.Model):
 
     @property
     def platform(self):
-        return self.social_account.platform
+        # Display platform, not the raw transport: a Zernio-bound account
+        # reports its destination (YouTube, TikTok, ...) here. Backend
+        # routing/filtering must NOT use this property -- it reads the raw
+        # ``social_account.platform`` directly (see reply_policy/services).
+        return self.social_account.display_platform
 
     @property
     def attachments(self):

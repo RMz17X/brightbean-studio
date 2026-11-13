@@ -22,7 +22,7 @@
                         <div class="flex items-center gap-1">
                             {% if message.social_account.platform == "youtube" %}
                             <a href="{% if message.extra.video_id %}https://www.youtube.com/watch?v={{ message.extra.video_id|urlencode }}{% else %}https://www.youtube.com/channel/{{ message.social_account.account_platform_id|urlencode }}{% endif %}" target="_blank" rel="noopener noreferrer" class="text-[11px] font-semibold text-stone-500 underline underline-offset-2">YouTube</a>
-                            {% else %}{% include "partials/_platform_icon.html" with platform=message.social_account.platform size="sm" %}{% endif %}
+                            {% else %}{% include "partials/_platform_icon.html" with platform=message.social_account.display_platform size="sm" %}{% endif %}
                             <span class="text-[11px] text-stone-500">{{ message.social_account.account_name|default:message.social_account.account_handle }}</span>
                         </div>
                         <span class="text-[11px] text-stone-400">{{ message.received_at|date:"N j, Y g:i A" }}</span>

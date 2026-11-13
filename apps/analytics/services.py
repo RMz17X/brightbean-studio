@@ -818,7 +818,10 @@ def _media_kind(post: PlatformPost) -> str:
         "google_business": "Post",
         "mastodon": "Post",
     }
-    return platform_default.get(post.social_account.platform, "Post")
+    # Zernio is a transport, not a platform: a Zernio-YouTube/TikTok post
+    # is a "Video", so resolve via display_platform (the binding's
+    # destination), not the raw "zernio" platform slug.
+    return platform_default.get(post.social_account.display_platform, "Post")
 
 
 def _first_media_preview(post: PlatformPost) -> dict[str, str] | None:

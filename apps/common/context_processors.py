@@ -42,6 +42,7 @@ def sidebar_context(request):
 
         sidebar_channels = list(
             SocialAccount.objects.for_workspace(workspace.id)
+            .select_related("zernio_binding")
             .filter(connection_status=SocialAccount.ConnectionStatus.CONNECTED)
             .annotate(
                 queued_post_count=Count(
@@ -54,6 +55,7 @@ def sidebar_context(request):
 
         sidebar_unhealthy_channels = list(
             SocialAccount.objects.for_workspace(workspace.id)
+            .select_related("zernio_binding")
             .filter(
                 connection_status__in=[
                     SocialAccount.ConnectionStatus.DISCONNECTED,

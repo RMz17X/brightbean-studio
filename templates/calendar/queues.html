@@ -43,7 +43,7 @@
                     <select name="social_account_id" required class="form-input w-full text-sm">
                         <option value="">Select channel...</option>
                         {% for acc in accounts %}
-                        <option value="{{ acc.id }}">{{ acc.account_name|default:acc.account_handle }} ({{ acc.get_platform_display }})</option>
+                        <option value="{{ acc.id }}">{{ acc.account_name|default:acc.account_handle }} ({{ acc.display_platform_label }})</option>
                         {% endfor %}
                     </select>
                 </div>

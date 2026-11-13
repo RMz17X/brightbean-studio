@@ -33,8 +33,8 @@ Context: week_days, week_slots, today, default_workspace.
                class="cross-post-chip status-{{ pp.status }}"
                title="{{ pp.post.workspace.name }}: {{ pp.post.caption_snippet }}">
                 <span class="ws-dot" style="background: {{ pp.post.workspace.primary_color|default:'#F97316' }};"></span>
-                <span class="w-4 h-4 rounded flex items-center justify-center pi-{{ pp.social_account.platform }} flex-shrink-0 text-white">
-                    {% include "social_accounts/partials/_platform_icon.html" with platform=pp.social_account.platform size="3" %}
+                <span class="w-4 h-4 rounded flex items-center justify-center pi-{{ pp.social_account.display_platform }} flex-shrink-0 text-white">
+                    {% include "social_accounts/partials/_platform_icon.html" with platform=pp.social_account.display_platform size="3" %}
                 </span>
                 {% with first_media=pp.post.media_attachments.all.0 %}
                 {% if first_media and first_media.media_asset.thumbnail %}
