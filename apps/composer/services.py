@@ -85,6 +85,11 @@ def create_post(
     author=None,
     status: str = "draft",
     platform_overrides: dict[Any, dict[str, str | None]] | None = None,
+    youtube_privacy_status: str | None = None,
+    youtube_tags: Iterable[str] | None = None,
+    youtube_thumbnail_asset_id: Any | None = None,
+    youtube_category_id: str | None = None,
+    youtube_made_for_kids: bool | None = None,
 ):
     """Create a ``Post`` + one ``PlatformPost`` for ``social_account``.
 
@@ -113,6 +118,23 @@ def create_post(
     * Media assets are attached in order by their position in
       ``media_asset_ids``. They must already live in the workspace's
       media library.
+    * YouTube-only options (``youtube_*``) are stored on the
+      ``PlatformPost.platform_extra`` using exactly the keys the
+      publisher engine / YouTube provider read — ``privacy_status``,
+      ``tags``, ``category_id``, ``thumbnail_asset_id`` and
+      ``self_declared_made_for_kids`` (note: the provider reads
+      ``self_declared_made_for_kids``, never ``made_for_kids``) — and
+      only when the destination platform is YouTube, only when the
+      option was actually supplied. Via Zernio only ``privacy_status``
+      and ``tags`` are kept (Zernio has no thumbnail / made-for-kids /
+      category field — mirrors the composer view and
+      ``SocialAccount.ZERNIO_ADVANCED_FIELDS``). A
+      ``youtube_thumbnail_asset_id`` must reference a ``MediaAsset``
+      in the same workspace or ``ValueError`` is raised (→ 422 on the
+      REST route). Omitting every ``youtube_*`` option leaves
+      ``platform_extra`` empty and publish-time defaults apply
+      (public, no tags, no thumbnail, category ``"22"``, not made
+      for kids).
 
     Returns the persisted ``Post`` with one ``PlatformPost`` child.
     """
@@ -172,6 +194,55 @@ def create_post(
         if missing:
             raise ValueError(f"Media asset(s) not found in workspace {workspace.id}: {missing}")
 
+    # YouTube-only options → platform_extra (see contract above).
+    # Validated here, before any row is written, so a bad thumbnail id
+    # fails closed with no Post / PlatformPost left behind.
+    destination = getattr(social_account, "display_platform", None) or social_account.platform
+    via_zernio = social_account.platform == "zernio" and bool(getattr(social_account, "is_via_zernio", False))
+    youtube_extra: dict[str, Any] = {}
+    if destination == "youtube":
+        if youtube_privacy_status is not None:
+            if youtube_privacy_status not in ("public", "unlisted", "private"):
+                raise ValueError(
+                    "youtube_privacy_status must be one of 'public', 'unlisted', 'private'; "
+                    f"got {youtube_privacy_status!r}."
+                )
+            youtube_extra["privacy_status"] = youtube_privacy_status
+        if youtube_tags:
+            cleaned_tags: list[str] = []
+            seen_tags: set[str] = set()
+            for raw_tag in youtube_tags:
+                tag = str(raw_tag).strip()
+                if tag and tag not in seen_tags:
+                    seen_tags.add(tag)
+                    cleaned_tags.append(tag)
+            if cleaned_tags:
+                youtube_extra["tags"] = cleaned_tags
+        if not via_zernio:
+            if youtube_category_id is not None:
+                youtube_extra["category_id"] = youtube_category_id
+            if youtube_made_for_kids is not None:
+                youtube_extra["self_declared_made_for_kids"] = bool(youtube_made_for_kids)
+            if youtube_thumbnail_asset_id is not None:
+                try:
+                    thumb_uuid = (
+                        youtube_thumbnail_asset_id
+                        if isinstance(youtube_thumbnail_asset_id, uuid.UUID)
+                        else uuid.UUID(str(youtube_thumbnail_asset_id))
+                    )
+                except (ValueError, TypeError, AttributeError):
+                    thumb_uuid = None
+                thumb_asset = (
+                    MediaAsset.objects.filter(id=thumb_uuid, workspace=workspace).first()
+                    if thumb_uuid is not None
+                    else None
+                )
+                if thumb_asset is None:
+                    raise ValueError(
+                        f"Thumbnail asset {youtube_thumbnail_asset_id} not found in workspace {workspace.id}."
+                    )
+                youtube_extra["thumbnail_asset_id"] = str(thumb_asset.id)
+
     if status == "scheduled":
         # A new post has no platform_extra, so a Pinterest pin has no board
         # yet and is refused here: it can be created as a draft, given a
@@ -211,6 +282,7 @@ def create_post(
             platform_specific_title=override.get("title"),
             platform_specific_caption=override.get("caption"),
             platform_specific_first_comment=override.get("first_comment"),
+            platform_extra=youtube_extra,
         )
         for position, (_mid, u) in enumerate(resolved):
             # ``u`` is validated non-None and present in ``asset_map`` above
@@ -339,7 +411,7 @@ def clone_post(post, *, author=None):
                         platform_specific_media=copy.deepcopy(pp.platform_specific_media),
                         platform_extra=copy.deepcopy(
                             authored_youtube_settings(pp.platform_extra)
-                            if pp.social_account.platform == "youtube"
+                            if pp.social_account.display_platform == "youtube"
                             else pp.platform_extra or {}
                         ),
                     )
@@ -435,10 +507,10 @@ def media_blocker(social_account, *, media_types) -> str:
     from apps.media_library.models import MediaAsset
     from providers import is_video_only, requires_media
 
-    platform = social_account.get_platform_display()
-    if is_video_only(social_account.platform) and MediaAsset.MediaType.VIDEO not in media_types:
+    platform = social_account.display_platform_label
+    if is_video_only(social_account.display_platform) and MediaAsset.MediaType.VIDEO not in media_types:
         return f"{platform} can only publish videos. Add a video to this post before scheduling it."
-    if requires_media(social_account.platform) and not media_types:
+    if requires_media(social_account.display_platform) and not media_types:
         return f"{platform} needs an image or a video. Add one to this post before scheduling it."
     return ""
 
@@ -456,6 +528,8 @@ def publish_blocker(social_account, *, media_types, platform_extra: dict | None 
     reason = media_blocker(social_account, media_types=media_types)
     if reason:
         return reason
+    # Raw platform on purpose: Zernio has no boards, so a Zernio-routed
+    # Pinterest post must never be blocked for missing one.
     if social_account.platform == "pinterest" and not (platform_extra or {}).get("board_id"):
         return "Pinterest needs a board for every pin. Choose one for this post in the composer before scheduling it."
     return ""
@@ -493,8 +567,8 @@ def media_change_blocker(post, *, media_types_after) -> str:
     children = post.platform_posts.filter(status=PlatformPost.Status.SCHEDULED).select_related("social_account")
     for child in children:
         if media_blocker(child.social_account, media_types=media_types_after):
-            platform = child.social_account.get_platform_display()
-            need = "a video" if is_video_only(child.social_account.platform) else "an image or a video"
+            platform = child.social_account.display_platform_label
+            need = "a video" if is_video_only(child.social_account.display_platform) else "an image or a video"
             return (
                 f"This post is scheduled to {platform}, which needs {need} on it. "
                 f"Keep one on the post, or unschedule it for {platform} first."

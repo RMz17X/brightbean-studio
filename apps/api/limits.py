@@ -54,6 +54,17 @@ from apps.social_accounts.models import SocialAccount
 #: ``"facebook_page"`` key as a no-op (the real platform code is
 #: ``"facebook"``), which silently dropped every Facebook account into
 #: ``_DEFAULT_FALLBACK=50/day`` instead of the intended 200/day cap.
+#:
+#: Keys are *effective* (destination) platform codes, and the lookup in
+#: :func:`resolve_platform_limit` keys off ``SocialAccount.display_platform``,
+#: not the raw transport. Zernio is a transport, not a platform, so there is
+#: deliberately NO ``"zernio"`` key here: a Zernio-bound account draws from
+#: its destination's bucket (Zernio-TikTok → ``"tiktok"`` → 15/day,
+#: Zernio-YouTube → ``"youtube"`` → 50/day, ...). An unbound Zernio account
+#: resolves to ``"zernio"`` and lands on ``_DEFAULT_FALLBACK`` — the same
+#: documented fallback as any destination with no key in this map (today
+#: only Zernio-LinkedIn, whose destination ``"linkedin"`` has no key; the
+#: map only carries ``"linkedin_personal"`` / ``"linkedin_company"``).
 PLATFORM_DAILY_POST_LIMIT: dict[str, int] = {
     "linkedin_personal": 100,
     "linkedin_company": 100,
@@ -72,10 +83,33 @@ PLATFORM_DAILY_POST_LIMIT: dict[str, int] = {
 _DEFAULT_FALLBACK = 50
 
 
+def _effective_platform(social_account: SocialAccount) -> str:
+    """Platform whose daily-post bucket this account draws from.
+
+    Zernio is a transport, not a platform: a Zernio-bound account posts
+    to its binding's destination, so it shares that destination's cap
+    (``SocialAccount.display_platform``). Direct accounts resolve to
+    themselves. An unbound Zernio account — or a duck-typed stand-in
+    without ``display_platform`` — falls back to the raw ``platform``;
+    ``"zernio"`` has no key in the map, so it lands on
+    ``_DEFAULT_FALLBACK`` (documented above).
+    """
+    return getattr(social_account, "display_platform", None) or social_account.platform
+
+
 def resolve_platform_limit(social_account: SocialAccount) -> int:
     """Effective per-24h cap for one ``SocialAccount``.
 
-    Order: per-account override → platform default → fallback.
+    Order: per-account override → destination-platform default → fallback.
+
+    Destination-aware: the lookup key is the *effective* platform
+    (:func:`_effective_platform`), not the raw transport. A Zernio-TikTok
+    account therefore gets TikTok's 15/day, a Zernio-YouTube account
+    YouTube's 50/day, and so on — the same numbers direct accounts get,
+    because the bucket follows where the post actually lands. No new
+    numbers are introduced: every value comes from
+    ``PLATFORM_DAILY_POST_LIMIT`` exactly as it already stood, so direct
+    accounts are byte-for-byte unaffected.
 
     Note the explicit ``is not None`` check: ``daily_post_limit_override``
     is a ``PositiveIntegerField(null=True)``, so an admin can legitimately
@@ -87,7 +121,7 @@ def resolve_platform_limit(social_account: SocialAccount) -> int:
     override = getattr(social_account, "daily_post_limit_override", None)
     if override is not None:
         return int(override)
-    return PLATFORM_DAILY_POST_LIMIT.get(social_account.platform, _DEFAULT_FALLBACK)
+    return PLATFORM_DAILY_POST_LIMIT.get(_effective_platform(social_account), _DEFAULT_FALLBACK)
 
 
 #: Statuses that *consume* the upstream platform's posting budget.
@@ -161,7 +195,7 @@ def check_platform_quota(social_account: SocialAccount) -> None:
         raise HttpError(
             429,
             _format_quota_message(
-                tier=f"platform_quota:{social_account.platform}",
+                tier=f"platform_quota:{_effective_platform(social_account)}",
                 limit=limit,
                 remaining=0,
                 retry_after=retry_after_seconds,

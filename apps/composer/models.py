@@ -324,8 +324,13 @@ class Post(models.Model):
 
     @property
     def platform_posts_summary(self):
-        """Summary of target platforms."""
-        return list(self.platform_posts.values_list("social_account__platform", flat=True))
+        """Summary of target platforms (effective/destination platform)."""
+        return [
+            pp.social_account.display_platform
+            for pp in self.platform_posts.select_related(
+                "social_account", "social_account__zernio_binding"
+            )
+        ]
 
 
 class PlatformPost(models.Model):
@@ -532,7 +537,7 @@ class PlatformPost(models.Model):
         ]
 
     def __str__(self):
-        return f"PlatformPost({self.social_account.platform}): {self.status}"
+        return f"PlatformPost({self.social_account.display_platform}): {self.status}"
 
     @property
     def is_reschedulable(self):
@@ -625,7 +630,8 @@ class PlatformPost(models.Model):
 
     @property
     def platform(self):
-        return self.social_account.platform
+        """Effective platform of this row (destination for Zernio accounts)."""
+        return self.social_account.display_platform
 
     @property
     def char_limit(self):

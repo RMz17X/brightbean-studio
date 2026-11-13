@@ -265,8 +265,21 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
         pp.platform_specific_caption = override_caption if override_caption else None
         pp.platform_specific_first_comment = override_comment if override_comment else None
 
-        # Per-platform extras
-        if account.platform == "facebook" and f"facebook_panel_{acc_id}" in request.POST:
+        # Per-platform extras, gated on the DESTINATION platform: a
+        # via-Zernio account gets the same panel — and the same saved
+        # options — as the same platform direct. Options with no Zernio
+        # padanan are not stored for via-Zernio accounts (see below).
+        destination = account.display_platform
+        via_zernio = account.is_via_zernio
+        if destination == "facebook" and via_zernio and f"facebook_panel_{acc_id}" in request.POST:
+            # Zernio has no Reel hint: a lone video goes out as a video,
+            # so drop any stale hint instead of storing one the transport
+            # can never honour.
+            extra = {**(pp.platform_extra or {})}
+            extra.pop("post_type", None)
+            pp.platform_extra = extra
+
+        elif destination == "facebook" and f"facebook_panel_{acc_id}" in request.POST:
             # Gated on the panel's hidden marker, which the composer renders for
             # every selected Facebook account regardless of media: that keeps a
             # non-composer save from wiping extras it never rendered, while
@@ -293,20 +306,41 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
                 extra.pop("post_type", None)
             pp.platform_extra = extra
 
-        elif account.platform == "youtube":
+        elif destination == "youtube":
             tags_list = parse_and_truncate_youtube_tag_string(request.POST.get(f"yt_tags_{acc_id}", ""))
             privacy_status = request.POST.get(f"yt_privacy_status_{acc_id}", "public")
             if privacy_status not in ("public", "unlisted", "private"):
                 privacy_status = "public"
             thumb_id = request.POST.get(f"yt_thumbnail_asset_id_{acc_id}", "").strip() or None
-            pp.platform_extra = {
-                "privacy_status": privacy_status,
-                "self_declared_made_for_kids": request.POST.get(f"yt_made_for_kids_{acc_id}") == "true",
-                "tags": tags_list,
-                "thumbnail_asset_id": thumb_id,
-            }
+            # Merge onto the stored extras (Facebook pattern): the web
+            # panel only owns privacy/tags(/kids/thumbnail) — anything
+            # else already in platform_extra (e.g. category_id set via
+            # the API) must survive a web save.
+            extra = {**(pp.platform_extra or {})}
+            if via_zernio:
+                # Zernio carries privacy (as visibility) and tags, but has
+                # no field for made_for_kids or a thumbnail: store only
+                # what the transport can honour.
+                extra.update(
+                    {
+                        "privacy_status": privacy_status,
+                        "tags": tags_list,
+                    }
+                )
+            else:
+                extra.update(
+                    {
+                        "privacy_status": privacy_status,
+                        "self_declared_made_for_kids": request.POST.get(f"yt_made_for_kids_{acc_id}") == "true",
+                        "tags": tags_list,
+                        "thumbnail_asset_id": thumb_id,
+                    }
+                )
+            pp.platform_extra = extra
 
-        elif account.platform == "pinterest":
+        elif destination == "pinterest" and not via_zernio:
+            # Board / link / alt text / cover have no Zernio padanan:
+            # storing them would advertise options the transport drops.
             board_id = request.POST.get(f"pin_board_id_{acc_id}", "").strip()
             if not board_id:
                 board_id = (pp.platform_extra or {}).get("board_id") or None
@@ -320,7 +354,7 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
                 "cover_image_asset_id": request.POST.get(f"pin_cover_image_asset_id_{acc_id}", "").strip() or None,
             }
 
-        elif account.platform == "tiktok" and f"tiktok_privacy_level_{acc_id}" in request.POST:
+        elif destination == "tiktok" and f"tiktok_privacy_level_{acc_id}" in request.POST:
             # Only rebuild extras when the TikTok panel was part of the form,
             # so non-composer saves can't wipe a previously chosen privacy level.
             privacy = request.POST.get(f"tiktok_privacy_level_{acc_id}", "").strip()
@@ -335,10 +369,14 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
                 "disable_comment": request.POST.get(f"tiktok_allow_comment_{acc_id}") != "true",
                 "disable_duet": request.POST.get(f"tiktok_allow_duet_{acc_id}") != "true",
                 "disable_stitch": request.POST.get(f"tiktok_allow_stitch_{acc_id}") != "true",
-                "brand_organic_toggle": request.POST.get(f"tiktok_brand_organic_{acc_id}") == "true",
-                "brand_content_toggle": request.POST.get(f"tiktok_brand_content_{acc_id}") == "true",
                 "is_aigc": request.POST.get(f"tiktok_is_aigc_{acc_id}") == "true",
             }
+            if not via_zernio:
+                # Zernio's tiktokSettings has no brand-disclosure field
+                # (commercial_content_type is fixed "none"): don't store
+                # options the transport drops.
+                extra["brand_organic_toggle"] = request.POST.get(f"tiktok_brand_organic_{acc_id}") == "true"
+                extra["brand_content_toggle"] = request.POST.get(f"tiktok_brand_content_{acc_id}") == "true"
             if privacy:
                 extra["privacy_level"] = privacy
             # Cover frame timestamp from the composer's frame picker; omitted
@@ -347,7 +385,8 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
             # non-ASCII digits (e.g. "²", "١٢") that int() then rejects with an
             # unhandled ValueError.
             cover_ms = request.POST.get(f"tiktok_video_cover_timestamp_ms_{acc_id}", "").strip()
-            if cover_ms:
+            # No Zernio field for a cover timestamp either.
+            if cover_ms and not via_zernio:
                 try:
                     cover_ms_val = int(cover_ms)
                 except ValueError:
@@ -425,7 +464,7 @@ def _validate_required_media(request, post, workspace, action):
 
     accounts = list(SocialAccount.objects.filter(id__in=selected_ids, workspace=workspace))
     # Skip the media lookup when no selected platform cares about it.
-    if not any(requires_media(account.platform) for account in accounts):
+    if not any(requires_media(account.display_platform) for account in accounts):
         return None
     media_types = _composer_media_types(request, post, workspace)
     blocked = [account for account in accounts if media_blocker(account, media_types=media_types)]
@@ -434,8 +473,8 @@ def _validate_required_media(request, post, workspace, action):
 
     # Worded apart from media_blocker's because this form can also be fixed by
     # deselecting the account, and it names every platform at once.
-    video_only = sorted({a.get_platform_display() for a in blocked if is_video_only(a.platform)})
-    any_media = sorted({a.get_platform_display() for a in blocked if not is_video_only(a.platform)})
+    video_only = sorted({a.display_platform_label for a in blocked if is_video_only(a.display_platform)})
+    any_media = sorted({a.display_platform_label for a in blocked if not is_video_only(a.display_platform)})
     sentences = []
     if video_only:
         sentences.append(f"{get_text_list(video_only, 'and')} can only publish videos.")
@@ -466,12 +505,12 @@ def _save_version(post, user):
         "platform_posts": [
             {
                 "social_account_id": str(pp.social_account_id),
-                "platform": pp.social_account.platform,
+                "platform": pp.social_account.display_platform,
                 "title_override": pp.platform_specific_title,
                 "caption_override": pp.platform_specific_caption,
                 "first_comment_override": pp.platform_specific_first_comment,
                 "platform_extra": authored_youtube_settings(pp.platform_extra)
-                if pp.social_account.platform == "youtube"
+                if pp.social_account.display_platform == "youtube"
                 else pp.platform_extra or {},
             }
             for pp in post.platform_posts.select_related("social_account")
@@ -652,6 +691,7 @@ def compose(request, workspace_id, post_id=None):
     # Connected social accounts for this workspace
     social_accounts = (
         SocialAccount.objects.for_workspace(workspace.id)
+        .select_related("zernio_binding")
         .filter(
             connection_status=SocialAccount.ConnectionStatus.CONNECTED,
         )
@@ -670,14 +710,23 @@ def compose(request, workspace_id, post_id=None):
         cfg = dict(acc.field_config)
         cfg["supports_first_comment"] = acc.supports_first_comment()
         char_limits[str(acc.id)] = {
-            "platform": acc.platform,
+            # "platform" is the DESTINATION platform: the composer panels
+            # gate on it, so a via-Zernio account gets the same panel as
+            # the same platform direct. The dead sub-options inside a
+            # panel (YouTube thumbnail / made_for_kids, Pinterest board,
+            # TikTok brand disclosure / cover, Facebook Reel hint) are
+            # hidden by the template via "transport" instead, and _sync
+            # refuses to store them for via-Zernio accounts.
+            "platform": acc.display_platform,
+            "display_platform": acc.display_platform,
+            "transport": acc.transport,
             "limit": acc.char_limit,
             # Each of these costs two characters once the provider escapes it,
             # so the live counter can charge for them as the user types.
             "escaped_chars": acc.escaped_chars,
             "name": acc.account_name or acc.account_handle,
             "youtube_url": f"https://www.youtube.com/channel/{acc.account_platform_id}"
-            if acc.platform == "youtube"
+            if acc.display_platform == "youtube"
             else "",
             **cfg,
         }
@@ -2153,7 +2202,9 @@ def tiktok_creator_info(request, workspace_id, account_id):
     creator's account settings.
     """
     workspace = _get_workspace(request, workspace_id)
-    account = get_object_or_404(SocialAccount, id=account_id, workspace=workspace, platform="tiktok")
+    account = get_object_or_404(SocialAccount, id=account_id, workspace=workspace)
+    if account.display_platform != "tiktok":
+        raise Http404("No TikTok account matches the given query.")
 
     from apps.credentials.models import resolve_platform_credentials
     from providers import get_provider
@@ -2179,6 +2230,13 @@ def tiktok_creator_info(request, workspace_id, account_id):
                 "max_video_post_duration_sec": None,
             }
         )
+
+    if account.is_via_zernio:
+        # Zernio exposes no TikTok creator-info endpoint, so there are no
+        # per-creator privacy options or interaction locks to fetch: the
+        # panel falls back to TikTok's default options, exactly as it does
+        # when the direct TikTok API is unreachable.
+        return _unavailable("Zernio doesn't expose TikTok creator info; using TikTok's default privacy options.")
 
     # Refresh token if expiring
     access_token = account.oauth_access_token
@@ -3703,7 +3761,7 @@ def csv_confirm_import(request, workspace_id):
                             )
                             if created and status != initial_pp_status:
                                 drafted_count += 1
-                                drafted_platforms.add(acc.get_platform_display())
+                                drafted_platforms.add(acc.display_platform_label)
 
             created_count += 1
         except Exception:
