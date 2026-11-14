@@ -798,6 +798,7 @@ def _attachment(media_type: str, url: str, *, has_file: bool = True):
     asset.media_type = media_type
     asset.filename = "asset.bin"
     asset.duration = 0
+    asset.processing_status = "completed"  # gate: dispatch only runs for finished assets
     asset.file = MagicMock() if has_file else None
     if has_file:
         asset.file.url = url

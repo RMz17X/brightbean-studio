@@ -9,7 +9,7 @@ from dateutil.relativedelta import relativedelta
 from django.utils import timezone
 
 from apps.composer.models import PlatformPost, Post, PostMedia
-from apps.composer.services import post_media_types, publish_blocker
+from apps.composer.services import post_media_processing_statuses, post_media_types, publish_blocker
 
 from .models import RecurrenceRule
 
@@ -82,6 +82,7 @@ def generate_recurring_posts():
         # Every clone carries the source's media, so one answer serves each
         # recurrence date and platform of this rule.
         media_types = post_media_types(source)
+        processing_statuses = post_media_processing_statuses(source)
 
         for d in dates:
             if d in existing_dates or d <= today_local:
@@ -111,7 +112,10 @@ def generate_recurring_posts():
                     # left as a draft at its date: still on the calendar to fix,
                     # but not handed to the publisher.
                     blocked = publish_blocker(
-                        pp.social_account, media_types=media_types, platform_extra=pp.platform_extra
+                        pp.social_account,
+                        media_types=media_types,
+                        platform_extra=pp.platform_extra,
+                        processing_statuses=processing_statuses,
                     )
                     if blocked:
                         logger.warning(

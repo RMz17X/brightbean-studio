@@ -171,7 +171,7 @@ def _visible_posts_qs(api_key):
 
 
 def _get_post_for_key(api_key, post_id_str: str) -> Post:
-    """Allowlist-respecting Post fetch shared by ``get_post`` / ``cancel_post``.
+    """Allowlist-respecting Post fetch shared by ``get_post`` / ``cancel_post`` / ``delete_post``.
 
     Out-of-scope and nonexistent both surface as "Post not found" — the API
     never reveals which is which.
@@ -701,6 +701,52 @@ def _cancel_post(args: dict, context: dict[str, Any]) -> dict:
                 raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
     post.refresh_from_db()
     return _wrap_text(_serialize_post(post, context))
+
+
+def _delete_post(args: dict, context: dict[str, Any]) -> dict:
+    from django.db import transaction
+
+    _require_perm(context, "create_posts")
+    if "post_id" not in args:
+        raise JsonRpcError(INVALID_PARAMS, "post_id is required")
+    api_key = context["api_key"]
+    post = _get_post_for_key(api_key, args["post_id"])
+    if any(pp.status == "publishing" for pp in post.platform_posts.all()):
+        raise JsonRpcError(
+            INVALID_PARAMS,
+            "Post is currently publishing; wait for it to finish or cancel it first.",
+        )
+    # Capture the id first: Django clears ``pk`` on the in-memory object
+    # once the row is deleted (same reason as ``live_delete``).
+    row_id = post.id
+    with transaction.atomic():
+        # Cascade deletes PlatformPost → PublishLog, PostMedia (link rows
+        # only — MediaAsset rows survive), PostVersion and QueueEntry.
+        post.delete()
+    return _wrap_text({"post_id": str(row_id), "deleted": True})
+
+
+register_tool(
+    Tool(
+        name="delete_post",
+        description=(
+            "Delete a post and all of its platform children, publish logs, media links, "
+            "version snapshots and calendar queue entries. Any state may be deleted "
+            "EXCEPT while a child is publishing (error — wait for it to finish or cancel "
+            "it first). Deleting a published post deletes only Bean's record of it; "
+            "content already live on the platform STAYS LIVE — Bean has no unpublish "
+            "operation. Media assets themselves are NOT deleted. A deleted post cannot "
+            "be restored. Requires the create_posts permission."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {"post_id": {"type": "string", "format": "uuid"}},
+            "required": ["post_id"],
+            "additionalProperties": False,
+        },
+        handler=_delete_post,
+    )
+)
 
 
 register_tool(

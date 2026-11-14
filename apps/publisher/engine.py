@@ -764,6 +764,7 @@ class PublishEngine:
             account,
             media_types=usable_media_types(pm.media_asset for pm in attachments),
             platform_extra=platform_post.platform_extra,
+            processing_statuses=[pm.media_asset.processing_status for pm in attachments if pm.media_asset.file],
         )
         if blocker:
             raise PublishError(blocker, platform=account.display_platform_label, retryable=False)

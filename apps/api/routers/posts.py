@@ -37,6 +37,7 @@ from apps.api.middleware import (
 from apps.api.pagination import decode_offset_cursor, encode_offset_cursor
 from apps.api.schemas import (
     CreatePostRequest,
+    PostDeleteResponse,
     PostResponse,
     PostsListResponse,
     ScheduleRequest,
@@ -661,3 +662,45 @@ def cancel(request, post_id: uuid.UUID):
     post.refresh_from_db()
     log_audit_entry(request, action="post.cancel", target_id=post.id, status_code=200)
     return _post_to_response(request, post)
+
+
+@router.delete(
+    "/{post_id}",
+    response=PostDeleteResponse,
+    summary="Delete a post",
+    description=(
+        "Deletes the post and all of its platform children, publish logs, "
+        "media links, version snapshots and calendar queue entries. "
+        "Every state may be deleted EXCEPT while a child is publishing: a "
+        "post with a `publishing` child answers 422 — wait for it to "
+        "finish or cancel it first. Deleting a `published` post deletes "
+        "only Bean's record of it; content already live on the platform "
+        "STAYS LIVE — Bean has no unpublish operation, and deleting the "
+        "record does not retract the video or post. Unpublishing is not "
+        "part of this API. Media assets themselves are NOT deleted (only "
+        "the post's links to them); orphaned assets are swept later. A "
+        "deleted post cannot be restored; a second DELETE on the same id "
+        "answers 404."
+    ),
+)
+def delete_post(request, post_id: uuid.UUID):
+    enforce_http_rate_limits(request, is_write=True)
+    _require_perm(request, "create_posts")
+    post = _get_workspace_post(request, post_id)
+    if post.platform_posts.filter(status="publishing").exists():
+        raise HttpError(
+            422,
+            "Post is currently publishing; wait for it to finish or cancel it first.",
+        )
+    # Capture the id first: Django clears ``pk`` on the in-memory object
+    # once the row is deleted, so reading it afterwards yields None
+    # (same reason as ``live.delete``).
+    row_id = post.id
+    from django.db import transaction
+
+    with transaction.atomic():
+        # Cascade deletes PlatformPost → PublishLog, PostMedia (link rows
+        # only — MediaAsset rows survive), PostVersion and QueueEntry.
+        post.delete()
+    log_audit_entry(request, action="post.delete", target_id=row_id, status_code=200)
+    return PostDeleteResponse(id=row_id, deleted=True)

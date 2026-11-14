@@ -29,6 +29,7 @@ def _attachment(asset_id, *, media_type="image", filename="a.jpg", duration=0):
     asset.media_type = media_type
     asset.filename = filename
     asset.duration = duration
+    asset.processing_status = "completed"  # gate: dispatch only runs for finished assets
     asset.file.url = f"https://cdn.example/{filename}"
     pm = MagicMock()
     pm.media_asset = asset

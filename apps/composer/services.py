@@ -327,6 +327,7 @@ def create_post(
         reason = publish_blocker(
             social_account,
             media_types=usable_media_types(asset_map.values()),
+            processing_statuses=[a.processing_status for a in asset_map.values() if a.file],
         )
         if reason:
             raise ValueError(reason)
@@ -587,6 +588,19 @@ def media_types_by_post(post_ids) -> dict:
     return by_post
 
 
+def post_media_processing_statuses(post, *, excluding=None) -> set[str]:
+    """``processing_status`` values of ``post``'s usable attachments.
+
+    Mirrors ``post_media_types``: only attachments with a stored file
+    count — an asset without a file is already excluded from the media
+    the publisher can use, so its processing state is irrelevant.
+    """
+    attachments = _usable_attachments().filter(post_id=post.pk)
+    if excluding is not None:
+        attachments = attachments.exclude(pk=excluding.pk)
+    return set(attachments.values_list("media_asset__processing_status", flat=True).distinct())
+
+
 def media_blocker(social_account, *, media_types) -> str:
     """Why ``social_account`` can't publish a post with these media, or "".
 
@@ -604,19 +618,39 @@ def media_blocker(social_account, *, media_types) -> str:
     return ""
 
 
-def publish_blocker(social_account, *, media_types, platform_extra: dict | None = None) -> str:
+def publish_blocker(
+    social_account,
+    *,
+    media_types,
+    platform_extra: dict | None = None,
+    processing_statuses: Iterable[str] | None = None,
+) -> str:
     """Why a post can't publish to ``social_account`` as it stands, or "".
 
     The one statement of this rule. The publisher checks it before calling a
     platform, and every path that schedules a post checks it first so the user
     hears about it then rather than after the post's other platforms have gone
     out. Only failures that are certain before the platform is ever called: the
-    media a platform can't do without (``media_blocker``), and a pin with no
-    board, which our own Pinterest provider refuses.
+    media a platform can't do without (``media_blocker``), a media asset that
+    is still being processed (its duration/thumbnail aren't final yet, so the
+    platform would fetch an unfinished file), and a pin with no board, which
+    our own Pinterest provider refuses.
+
+    ``processing_statuses`` is the ``processing_status`` of each attached
+    asset that has a stored file; ``None`` means the caller has no asset
+    info (e.g. the CSV import's board-only check) and keeps the old
+    behaviour — the gate is skipped. Any status other than ``completed``
+    blocks.
     """
+    from apps.media_library.models import MediaAsset
+
     reason = media_blocker(social_account, media_types=media_types)
     if reason:
         return reason
+    if processing_statuses is not None and any(
+        status != MediaAsset.ProcessingStatus.COMPLETED for status in processing_statuses
+    ):
+        return "Media is still processing; wait until processing completes before scheduling."
     # Raw platform on purpose: Zernio has no boards, so a Zernio-routed
     # Pinterest post must never be blocked for missing one.
     if social_account.platform == "pinterest" and not (platform_extra or {}).get("board_id"):
@@ -624,18 +658,27 @@ def publish_blocker(social_account, *, media_types, platform_extra: dict | None 
     return ""
 
 
-def require_publishable(platform_post, *, media_types=None) -> None:
+def require_publishable(platform_post, *, media_types=None, processing_statuses=None) -> None:
     """Raise ``ValueError`` if ``platform_post`` is certain to fail at publish time.
 
     ``media_types`` lets a caller checking many rows answer it for all of them
     in one query (``media_types_by_post``) instead of one per row.
+    ``processing_statuses`` is the same idea for the processing gate; when
+    omitted it is read off the post's own attachments (one query via
+    ``post_media_processing_statuses``), so every existing caller — the REST
+    ``/schedule`` route, the MCP ``schedule_draft`` tool, the composer's
+    per-account transition endpoint and the calendar drop/promote paths —
+    gets the gate without changing its call.
     """
     if media_types is None:
         media_types = post_media_types(platform_post.post)
+    if processing_statuses is None:
+        processing_statuses = post_media_processing_statuses(platform_post.post)
     reason = publish_blocker(
         platform_post.social_account,
         media_types=media_types,
         platform_extra=platform_post.platform_extra,
+        processing_statuses=processing_statuses,
     )
     if reason:
         raise ValueError(reason)
