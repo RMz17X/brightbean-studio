@@ -252,6 +252,54 @@ def map_post_status(status: str | None) -> PublishState:
     return _POST_STATUS_MAP.get(str(status or "").lower(), PublishState.PENDING)
 
 
+# Keys that can carry a post id in a Zernio response body. Zernio wraps
+# single-post payloads (``{"post": {...}}`` — proven live 2026-11-14: the
+# GET /v1/posts/{id} body carries status inside ``post``), and its
+# duplicate error names the post that already exists via
+# ``existingPostId``. The create response has been seen with the id in
+# none of the top-level fields the old parser read — which is exactly how
+# a live YouTube publish was recorded as a failure and retried into 409
+# duplicates.
+_POST_ID_KEYS = ("_id", "id", "postId", "post_id", "existingPostId", "existing_post_id")
+
+
+def _post_response_candidates(data: dict) -> list[dict]:
+    """Response body first, then its ``post``/``data`` wrappers, in order."""
+    candidates = [data]
+    for key in ("post", "data"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    return candidates
+
+
+def extract_zernio_post_id(data: dict) -> str:
+    """Post id from a Zernio response body, in every shape Zernio uses.
+
+    Searches the top level first (the old behaviour), then the ``post``
+    and ``data`` wrappers. Returns "" when no id can be found anywhere.
+    """
+    for candidate in _post_response_candidates(data):
+        for id_key in _POST_ID_KEYS:
+            value = candidate.get(id_key)
+            if value:
+                return str(value)
+    return ""
+
+
+def extract_zernio_field(data: dict, field: str) -> str:
+    """A scalar field (``status``/``url``/``error``/...) from a Zernio body.
+
+    Same search order as :func:`extract_zernio_post_id`: top level,
+    then ``post``, then ``data``. Returns "" when the field is absent.
+    """
+    for candidate in _post_response_candidates(data):
+        value = candidate.get(field)
+        if value:
+            return str(value)
+    return ""
+
+
 def build_post_payload(
     *,
     content: PublishContent,
@@ -599,6 +647,11 @@ class ZernioProvider(SocialProvider):
         Zernio YouTube account fails earlier, at credential/profile
         lookup, which is an account-connection problem, not a refusal
         of the route.
+
+        Reconciliation, not blind retry: a 2xx whose body carries no
+        post id in any shape is a non-retryable failure (the post may
+        already be live — retrying would only 409), and a 409 duplicate
+        reconciles to the existing post id instead of failing.
         """
         if content is None:
             raise PublishError("Nothing to publish.", platform=self.platform_name, retryable=False)
@@ -615,17 +668,51 @@ class ZernioProvider(SocialProvider):
         except APIError as exc:
             if exc.status_code in (401, 403):
                 raise self._auth_error_from(exc)
+            if exc.status_code == 409:
+                # Duplicate: Zernio refused a second copy of content it
+                # already accepted. The body names the post that already
+                # exists — reconcile to it instead of failing or retrying
+                # (a retry would 409 again and never create a new post).
+                existing_id = extract_zernio_post_id(exc.raw_response or {})
+                if existing_id:
+                    logger.warning(
+                        "Zernio 409 duplicate for %s; reconciling to existing post %s",
+                        destination,
+                        existing_id,
+                    )
+                    return PublishResult(
+                        platform_post_id=existing_id,
+                        url=None,
+                        extra={
+                            "zernio_status": "duplicate",
+                            "destination_platform": destination,
+                            "reconciled_from_409": True,
+                        },
+                    )
+                raise ProviderError(
+                    "Zernio reports this content was already posted (duplicate) but named no existing post id. Check zernio.com before republishing.",
+                    platform=self.platform_name,
+                    raw_response=exc.raw_response or {},
+                    retryable=False,
+                )
             raise
         data = self._safe_json(response)
-        post_id = str(data.get("_id") or data.get("id") or "")
+        post_id = extract_zernio_post_id(data)
         if not post_id:
+            # The POST itself succeeded (2xx), so the post may already be
+            # live at Zernio — but with no id there is nothing to confirm
+            # it against. NEVER retry this blindly: a retry re-sends the
+            # same content and Zernio answers 409 duplicate. Fail
+            # permanently with a message that says the outcome is unknown
+            # and where to check, instead of scheduling a duplicate.
             raise ProviderError(
-                "Zernio accepted the post but returned no post id.",
+                "Zernio accepted the post but returned no post id. The post may already be live — check zernio.com before republishing; this will not be retried automatically.",
                 platform=self.platform_name,
                 raw_response=data,
+                retryable=False,
             )
-        status = str(data.get("status") or "")
-        url = data.get("url") or data.get("postUrl")
+        status = extract_zernio_field(data, "status")
+        url = extract_zernio_field(data, "url") or extract_zernio_field(data, "postUrl")
         logger.info("Zernio post %s created for %s (status=%s)", post_id, destination, status or "unknown")
         return PublishResult(
             platform_post_id=post_id,
@@ -634,7 +721,11 @@ class ZernioProvider(SocialProvider):
         )
 
     def check_publish_status(self, access_token: str | None = None, handle: str = "") -> PublishStatus:
-        """``GET /v1/posts/{id}`` -> mapped publish state."""
+        """``GET /v1/posts/{id}`` -> mapped publish state.
+
+        Zernio wraps the post in a ``post`` object — status/error/url
+        are read from ``post.*`` with a top-level fallback.
+        """
         if not handle:
             raise ProviderError("No Zernio post id to check.", platform=self.platform_name, retryable=False)
         key = self._api_key(access_token)
@@ -645,12 +736,16 @@ class ZernioProvider(SocialProvider):
                 raise self._auth_error_from(exc)
             raise
         data = self._safe_json(response)
-        status = str(data.get("status") or "")
+        status = extract_zernio_field(data, "status")
         state = map_post_status(status)
         error = ""
         if state is PublishState.FAILED:
-            error = str(data.get("error") or data.get("message") or f"Zernio reported status {status!r}.")
-        url = data.get("url") or data.get("postUrl")
+            error = (
+                extract_zernio_field(data, "error")
+                or extract_zernio_field(data, "message")
+                or f"Zernio reported status {status!r}."
+            )
+        url = extract_zernio_field(data, "url") or extract_zernio_field(data, "postUrl")
         return PublishStatus(
             state=state,
             platform_post_id=handle if state is PublishState.COMPLETE else "",

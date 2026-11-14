@@ -9,11 +9,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from providers.exceptions import PublishError
+from providers.exceptions import APIError, ProviderError, PublishError
 from providers.types import PublishContent, PublishState, PublishStatus
 from providers.zernio import (
     ZernioProvider,
     build_post_payload,
+    extract_zernio_field,
+    extract_zernio_post_id,
     map_post_status,
     mask_api_key,
     parse_accounts_response,
@@ -273,6 +275,82 @@ class TestPublishPost:
                 None, PublishContent(text="hi")
             )
 
+    @patch.object(ZernioProvider, "_request")
+    def test_publish_reads_nested_post_id(self, mock_request):
+        # Live 2026-11-14: Zernio wraps single-post payloads in {"post": ...}
+        # — the old parser only read top-level _id/id and recorded a live
+        # YouTube publish as a failure.
+        mock_request.return_value = _response({"post": {"_id": "post-nested-1", "status": "scheduled"}})
+        result = self._bound_provider().publish_post(
+            None,
+            PublishContent(text="hi", title="Hi", media_urls=["https://example.com/v.mp4"], media_types=["video"]),
+        )
+        assert result.platform_post_id == "post-nested-1"
+        assert result.extra["zernio_status"] == "scheduled"
+
+    @patch.object(ZernioProvider, "_request")
+    def test_publish_reads_data_wrapped_id(self, mock_request):
+        mock_request.return_value = _response({"data": {"id": "post-data-1", "status": "publishing"}})
+        result = self._bound_provider().publish_post(
+            None,
+            PublishContent(text="hi", title="Hi", media_urls=["https://example.com/v.mp4"], media_types=["video"]),
+        )
+        assert result.platform_post_id == "post-data-1"
+        assert result.extra["zernio_status"] == "publishing"
+
+    @patch.object(ZernioProvider, "_request")
+    def test_publish_without_any_id_is_not_retryable(self, mock_request):
+        # A 2xx with no id anywhere: the post may already be live, so the
+        # engine must NOT retry it — a retry re-sends the same content and
+        # Zernio answers 409 duplicate. The failure names reconciliation.
+        mock_request.return_value = _response({"status": "scheduled"})
+        with pytest.raises(ProviderError) as excinfo:
+            self._bound_provider().publish_post(
+                None,
+                PublishContent(text="hi", title="Hi", media_urls=["https://example.com/v.mp4"], media_types=["video"]),
+            )
+        assert excinfo.value.retryable is False
+        assert "check zernio.com" in str(excinfo.value)
+
+    @patch.object(ZernioProvider, "_request")
+    def test_publish_409_reconciles_to_existing_post(self, mock_request):
+        # Live 2026-11-14: the retry of an already-published video got 409
+        # with existingPostId. Reconcile to that id instead of failing —
+        # the confirmation sweep then settles it from the status endpoint.
+        mock_request.side_effect = APIError(
+            "Zernio API error 409: duplicate",
+            status_code=409,
+            platform="Zernio",
+            raw_response={
+                "message": "This exact content is already scheduled, publishing, or was posted to this account within the last 24 hours",
+                "existingPostId": "6af7f600c3a50cfc1c39716e",
+            },
+        )
+        result = self._bound_provider().publish_post(
+            None,
+            PublishContent(text="hi", title="Hi", media_urls=["https://example.com/v.mp4"], media_types=["video"]),
+        )
+        assert result.platform_post_id == "6af7f600c3a50cfc1c39716e"
+        assert result.extra["reconciled_from_409"] is True
+        assert mock_request.call_count == 1
+
+    @patch.object(ZernioProvider, "_request")
+    def test_publish_409_without_id_is_not_retryable(self, mock_request):
+        # A 409 proves the content already exists: retrying would 409
+        # again forever, so fail permanently instead of burning retries.
+        mock_request.side_effect = APIError(
+            "Zernio API error 409: duplicate",
+            status_code=409,
+            platform="Zernio",
+            raw_response={"message": "duplicate"},
+        )
+        with pytest.raises(ProviderError) as excinfo:
+            self._bound_provider().publish_post(
+                None,
+                PublishContent(text="hi", title="Hi", media_urls=["https://example.com/v.mp4"], media_types=["video"]),
+            )
+        assert excinfo.value.retryable is False
+
 
 class TestCheckPublishStatus:
     @patch.object(ZernioProvider, "_request")
@@ -296,6 +374,60 @@ class TestCheckPublishStatus:
         status = _provider(api_key=SK_KEY).check_publish_status(SK_KEY, "post1")
         assert status.state is PublishState.FAILED
         assert "TikTok rejected" in status.error
+
+    @patch.object(ZernioProvider, "_request")
+    def test_published_nested_post_is_complete(self, mock_request):
+        # Live 2026-11-14: GET /v1/posts/{id} returns {"post": {"status":
+        # ...}} — the old parser read top-level status only, so every
+        # check came back pending and the sweep could never confirm a
+        # published post.
+        mock_request.return_value = _response(
+            {"post": {"status": "published", "url": "https://youtube.com/watch?v=r4NtmAS0xHQ"}}
+        )
+        status = _provider(api_key=SK_KEY).check_publish_status(SK_KEY, "post1")
+        assert status.state is PublishState.COMPLETE
+        assert status.platform_post_id == "post1"
+        assert status.raw["status"] == "published"
+
+    @patch.object(ZernioProvider, "_request")
+    def test_publishing_nested_post_is_pending(self, mock_request):
+        mock_request.return_value = _response({"post": {"status": "publishing"}})
+        status = _provider(api_key=SK_KEY).check_publish_status(SK_KEY, "post1")
+        assert status.state is PublishState.PENDING
+        assert status.platform_post_id == ""
+
+    @patch.object(ZernioProvider, "_request")
+    def test_failed_nested_post_carries_error(self, mock_request):
+        mock_request.return_value = _response({"post": {"status": "failed", "error": "YouTube rejected the video."}})
+        status = _provider(api_key=SK_KEY).check_publish_status(SK_KEY, "post1")
+        assert status.state is PublishState.FAILED
+        assert "YouTube rejected" in status.error
+
+
+class TestExtractZernioResponse:
+    def test_top_level_id_wins(self):
+        assert extract_zernio_post_id({"_id": "top", "post": {"_id": "nested"}}) == "top"
+
+    def test_nested_post_id(self):
+        assert extract_zernio_post_id({"post": {"_id": "nested-1"}}) == "nested-1"
+
+    def test_data_wrapped_id(self):
+        assert extract_zernio_post_id({"data": {"id": "data-1"}}) == "data-1"
+
+    def test_existing_post_id_counts(self):
+        assert extract_zernio_post_id({"existingPostId": "already-there"}) == "already-there"
+
+    def test_no_id_anywhere_is_empty(self):
+        assert extract_zernio_post_id({"status": "scheduled", "post": {"status": "scheduled"}}) == ""
+
+    def test_field_prefers_nested_post(self):
+        assert extract_zernio_field({"post": {"status": "published"}}, "status") == "published"
+
+    def test_field_falls_back_to_top_level(self):
+        assert extract_zernio_field({"status": "failed"}, "status") == "failed"
+
+    def test_missing_field_is_empty(self):
+        assert extract_zernio_field({"post": {}}, "url") == ""
 
 
 class TestDiscoveryCalls:
