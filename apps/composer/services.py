@@ -71,6 +71,62 @@ def sync_post_scheduled_at(post):
 _INITIAL_STATUSES = {"draft", "scheduled"}
 
 
+def _zernio_state_extra(*, status: str, scheduled_at: dt.datetime | None) -> dict[str, Any]:
+    """The F12 draft/schedule keys a via-Zernio ``PlatformPost`` carries.
+
+    The provider side (``providers/zernio.py build_post_payload``) reads
+    exactly these two keys out of ``platform_extra``: ``is_draft`` →
+    Zernio ``isDraft``, ``scheduled_for`` → Zernio ``scheduledFor``; with
+    neither set the payload says ``publishNow``. A draft row is never
+    handed to the engine, so ``is_draft`` is a safety net for any path
+    that publishes a row without re-checking its status; a scheduled row
+    carries its effective publish time so Zernio holds it until then even
+    if our engine fires early. Any other status carries neither key.
+    """
+    if status == "draft":
+        return {"is_draft": True}
+    if status == "scheduled" and scheduled_at is not None:
+        return {"scheduled_for": scheduled_at.isoformat()}
+    return {}
+
+
+def sync_zernio_draft_schedule_extra(platform_post, *, save: bool = True) -> bool:
+    """Rewrite a via-Zernio row's F12 keys to match its current state.
+
+    Only rows whose account publishes through Zernio are touched — a
+    direct account's ``platform_extra`` is returned unchanged, so its
+    providers never see keys they don't read. A ``scheduled`` row takes
+    its own ``scheduled_at``, falling back to the parent ``Post``'s
+    aggregate when the row itself carries no time (the composer's
+    per-account chip schedules without stamping the row; the publisher
+    resolves the same fallback). Any other status drops both keys, so a
+    row that leaves draft/scheduled can never publish as a stale draft
+    or at a stale time.
+
+    Returns True when ``platform_extra`` changed. With ``save=True``
+    (default) the change is persisted immediately; with ``save=False``
+    the caller owns the save (e.g. ``transition_platform_post``, which
+    folds it into its own ``update_fields`` save).
+    """
+    account = platform_post.social_account
+    via_zernio = account.platform == "zernio" and bool(getattr(account, "is_via_zernio", False))
+    if not via_zernio:
+        return False
+    when = None
+    if platform_post.status == "scheduled":
+        when = platform_post.scheduled_at or getattr(platform_post.post, "scheduled_at", None)
+    wanted = _zernio_state_extra(status=platform_post.status, scheduled_at=when)
+    extra = dict(platform_post.platform_extra or {})
+    new_extra = {k: v for k, v in extra.items() if k not in ("is_draft", "scheduled_for")}
+    new_extra.update(wanted)
+    if new_extra == extra:
+        return False
+    platform_post.platform_extra = new_extra
+    if save:
+        platform_post.save(update_fields=["platform_extra", "updated_at"])
+    return True
+
+
 def create_post(
     *,
     workspace,
@@ -135,6 +191,15 @@ def create_post(
       ``platform_extra`` empty and publish-time defaults apply
       (public, no tags, no thumbnail, category ``"22"``, not made
       for kids).
+    * F12 (write side): when the destination account publishes
+      through Zernio — any destination platform, including YouTube
+      via Zernio — ``platform_extra`` also records the draft/schedule
+      state the Zernio provider reads: ``is_draft: True`` for a
+      ``draft``, ``scheduled_for`` (ISO 8601 of ``scheduled_at``) for
+      a ``scheduled`` post. Direct destinations never get these keys.
+      ``transition_platform_post`` (and the composer's own transitions)
+      re-derive them via ``sync_zernio_draft_schedule_extra`` so a
+      draft scheduled later doesn't keep a stale ``is_draft``.
 
     Returns the persisted ``Post`` with one ``PlatformPost`` child.
     """
@@ -242,6 +307,18 @@ def create_post(
                         f"Thumbnail asset {youtube_thumbnail_asset_id} not found in workspace {workspace.id}."
                     )
                 youtube_extra["thumbnail_asset_id"] = str(thumb_asset.id)
+
+    # F12 (write side): a via-Zernio destination — any destination
+    # platform — also records the draft/schedule state the Zernio
+    # provider reads out of platform_extra. Direct destinations never
+    # get these keys; their providers don't read them.
+    if via_zernio:
+        youtube_extra.update(
+            _zernio_state_extra(
+                status=status,
+                scheduled_at=scheduled_at if status == "scheduled" else None,
+            )
+        )
 
     if status == "scheduled":
         # A new post has no platform_extra, so a Pinterest pin has no board
@@ -366,6 +443,13 @@ def transition_platform_post(
             ).delete()
         elif target_status == "published":
             update_fields.add("published_at")  # set by transition_to
+        # F12: a via-Zernio row's draft/schedule keys follow the status
+        # this transition just set — a draft scheduled here must stop
+        # saying is_draft, and a scheduled row sent back to draft must
+        # stop advertising its old scheduled_for. Folded into this
+        # save (no extra write when nothing changed).
+        if sync_zernio_draft_schedule_extra(platform_post, save=False):
+            update_fields.add("platform_extra")
         platform_post.save(update_fields=list(update_fields))
 
     sync_post_scheduled_at(platform_post.post)
@@ -399,7 +483,7 @@ def clone_post(post, *, author=None):
         )
         children = list(post.platform_posts.all())
         if children:
-            PlatformPost.objects.bulk_create(
+            created_children = PlatformPost.objects.bulk_create(
                 [
                     PlatformPost(
                         post=new_post,
@@ -418,6 +502,11 @@ def clone_post(post, *, author=None):
                     for pp in children
                 ]
             )
+            # A clone always starts as a draft: a source row's
+            # scheduled_for must not survive onto the copy, and a
+            # via-Zernio copy records is_draft like any other draft.
+            for child in created_children:
+                sync_zernio_draft_schedule_extra(child)
         media = list(post.media_attachments.all())
         if media:
             PostMedia.objects.bulk_create(

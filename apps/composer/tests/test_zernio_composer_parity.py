@@ -124,7 +124,10 @@ class ZernioComposerParityTests(TestCase):
                 f"yt_thumbnail_asset_id_{account.id}": "00000000-0000-0000-0000-000000000000",
             },
         )
-        assert pp.platform_extra == {"privacy_status": "unlisted", "tags": ["berita", "rupiah"]}
+        # F12 transport keys (is_draft/scheduled_for) may also be present;
+        # they are not YouTube options.
+        extra = {k: v for k, v in pp.platform_extra.items() if k not in ("is_draft", "scheduled_for")}
+        assert extra == {"privacy_status": "unlisted", "tags": ["berita", "rupiah"]}
 
     def test_direct_youtube_save_stores_all_options(self):
         account = self._account("youtube")
@@ -159,7 +162,10 @@ class ZernioComposerParityTests(TestCase):
     def test_zernio_tiktok_save_drops_brand_and_cover(self):
         account = self._zernio_account("tiktok")
         pp = self._save(account, **self._tiktok_panel(account))
-        assert pp.platform_extra == {
+        # F12 transport keys (is_draft/scheduled_for) may also be present;
+        # they are not TikTok options.
+        extra = {k: v for k, v in pp.platform_extra.items() if k not in ("is_draft", "scheduled_for")}
+        assert extra == {
             "privacy_level": "SELF_ONLY",
             "disable_comment": False,
             "disable_duet": True,

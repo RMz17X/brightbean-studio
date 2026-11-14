@@ -58,6 +58,7 @@ from .services import (
     post_media_types,
     publish_blocker,
     require_publishable,
+    sync_zernio_draft_schedule_extra,
     usable_media_types,
 )
 from .status import READONLY_STATUSES, derive_post_status
@@ -1319,6 +1320,14 @@ def save_post(request, workspace_id, post_id=None):
             target_only = scoped_ids
         _transition_post_children(post, pending_target, only=target_only)
 
+    # F12: rows created above (initial_status) and rows moved just now
+    # can both leave a via-Zernio row's draft/schedule keys stale — a
+    # scheduled row still marked is_draft would go out as a Zernio
+    # draft. Re-derive the keys from each row's final state; direct
+    # accounts and already-correct rows are untouched (no write).
+    for _pp in post.platform_posts.select_related("post", "social_account").all():
+        sync_zernio_draft_schedule_extra(_pp)
+
     # Save version
     _save_version(post, request.user)
 
@@ -1396,6 +1405,12 @@ def transition_platform_post(request, workspace_id, post_id, platform_post_id):
     if target in ("scheduled", "publishing", "published") and pp.post.proposed_publish_at is not None:
         pp.post.proposed_publish_at = None
         pp.post.save(update_fields=["proposed_publish_at", "updated_at"])
+    # F12: this endpoint bypasses services.transition_platform_post, so
+    # re-derive the via-Zernio row's draft/schedule keys here — a draft
+    # scheduled from the chip menu must stop saying is_draft, and a
+    # scheduled row sent back to draft must stop advertising its old
+    # scheduled_for. No-op for direct accounts.
+    sync_zernio_draft_schedule_extra(pp)
     return JsonResponse({"ok": True, "status": pp.status, "platform_post_id": str(pp.id)})
 
 
@@ -3762,6 +3777,9 @@ def csv_confirm_import(request, workspace_id):
                             if created and status != initial_pp_status:
                                 drafted_count += 1
                                 drafted_platforms.add(acc.display_platform_label)
+                            # F12: keep via-Zernio draft/schedule keys in sync
+                            # (no-op for direct accounts).
+                            sync_zernio_draft_schedule_extra(_pp)
 
             created_count += 1
         except Exception:

@@ -14,11 +14,13 @@ from types import SimpleNamespace
 import pytest
 from django.utils import timezone
 
+from apps.api.models import IdempotencyRecord
 from apps.api_keys import services
 from apps.mcp.handlers import (
     _live_create,
     _live_delete,
     _live_list,
+    _live_recreate_stream,
     _live_transition,
 )
 from apps.mcp.protocol import INVALID_PARAMS, JsonRpcError
@@ -145,10 +147,12 @@ def _broadcast(workspace, account, **kwargs):
 class TestRegistration:
     def test_live_tools_registered(self):
         names = {t.name for t in all_tools()}
-        assert {"live_create", "live_list", "live_transition", "live_delete"} <= names
+        assert {"live_create", "live_list", "live_transition", "live_delete", "live_recreate_stream"} <= names
         assert get_tool("live_create") is not None
+        assert get_tool("live_recreate_stream") is not None
         assert is_read_only_tool("live_list") is True
         assert is_read_only_tool("live_create") is False
+        assert is_read_only_tool("live_recreate_stream") is False
 
 
 @pytest.mark.django_db
@@ -185,6 +189,132 @@ class TestLiveCreateTool:
             _live_create({"social_account_id": "00000000-0000-0000-0000-000000000000", "title": "Nope"}, context)
         assert excinfo.value.code == INVALID_PARAMS
         assert "create_posts" in excinfo.value.message
+
+
+@pytest.mark.django_db
+class TestLiveCreateIdempotency:
+    def test_same_key_replays_without_second_broadcast(self, context, youtube_account, provider):
+        args = {
+            "social_account_id": str(youtube_account.id),
+            "title": "MCP Live",
+            "idempotency_key": "idem-replay-1",
+        }
+        first = _payload(_live_create(args, context))
+        second = _payload(_live_create(args, context))
+        assert second == first
+        assert second["broadcast_id"] == "bcast-test-1"
+        assert second["stream_key"] == LIVE_KEY
+        assert LiveBroadcast.objects.count() == 1
+        assert [c for c in provider.calls if c[0] == "create_live_stream"] == [
+            ("create_live_stream", "MCP Live", "1080p", "30fps")
+        ]
+
+    def test_same_key_different_body_is_refused(self, context, youtube_account, provider):
+        base = {"social_account_id": str(youtube_account.id), "idempotency_key": "idem-body-1"}
+        _live_create({**base, "title": "First"}, context)
+        with pytest.raises(JsonRpcError) as excinfo:
+            _live_create({**base, "title": "Different"}, context)
+        assert excinfo.value.code == INVALID_PARAMS
+        assert "different request body" in excinfo.value.message
+        assert LiveBroadcast.objects.count() == 1
+
+    def test_in_flight_key_asks_for_retry(self, context, youtube_account, provider):
+        args = {
+            "social_account_id": str(youtube_account.id),
+            "title": "MCP Live",
+            "idempotency_key": "idem-flight-1",
+        }
+        _live_create(args, context)
+        # Push the stored slot back to PENDING so the retry sees a peer
+        # still in flight (same fingerprint — the handler's own).
+        IdempotencyRecord.objects.filter(key="idem-flight-1").update(response_status=0)
+        with pytest.raises(JsonRpcError) as excinfo:
+            _live_create(args, context)
+        assert excinfo.value.code == INVALID_PARAMS
+        assert "still in flight" in excinfo.value.message
+
+    def test_failed_create_releases_claim_so_retry_succeeds(self, context, youtube_account, provider):
+        args = {
+            "social_account_id": str(youtube_account.id),
+            "title": "MCP Live",
+            "idempotency_key": "idem-release-1",
+        }
+        original_create_stream = provider.create_live_stream
+
+        def _boom(*a, **k):
+            raise RuntimeError("boom")
+
+        provider.create_live_stream = _boom
+        try:
+            with pytest.raises(JsonRpcError):
+                _live_create(args, context)
+        finally:
+            provider.create_live_stream = original_create_stream
+        assert LiveBroadcast.objects.count() == 0
+        body = _payload(_live_create(args, context))
+        assert body["broadcast_id"] == "bcast-test-1"
+        assert LiveBroadcast.objects.count() == 1
+
+    def test_bad_idempotency_key_type_is_invalid_params(self, context, youtube_account):
+        with pytest.raises(JsonRpcError) as excinfo:
+            _live_create(
+                {"social_account_id": str(youtube_account.id), "title": "T", "idempotency_key": 42},
+                context,
+            )
+        assert excinfo.value.code == INVALID_PARAMS
+
+
+@pytest.mark.django_db
+class TestLiveRecreateStreamTool:
+    def test_recreate_returns_new_key_once(self, context, workspace, youtube_account, provider):
+        row = _broadcast(workspace, youtube_account)
+        body = _payload(_live_recreate_stream({"broadcast_id": str(row.id)}, context))
+        assert body["stream_key"] == LIVE_KEY
+        assert body["key_shown"] is True
+        assert body["stream_id"] == "stream-test-1"
+        row.refresh_from_db()
+        assert row.stream_id == "stream-test-1"
+        assert row.key_shown is True
+        assert ("delete_stream", "stream-mcp-1") in provider.calls
+
+    def test_recreate_refuses_live_broadcast(self, context, workspace, youtube_account, provider):
+        row = _broadcast(workspace, youtube_account, status=LiveBroadcast.Status.LIVE)
+        with pytest.raises(JsonRpcError) as excinfo:
+            _live_recreate_stream({"broadcast_id": str(row.id)}, context)
+        assert excinfo.value.code == INVALID_PARAMS
+
+    def test_recreate_requires_create_posts(self, context, workspace, youtube_account):
+        context["membership"] = SimpleNamespace(effective_permissions={"create_posts": False})
+        row = _broadcast(workspace, youtube_account)
+        with pytest.raises(JsonRpcError) as excinfo:
+            _live_recreate_stream({"broadcast_id": str(row.id)}, context)
+        assert excinfo.value.code == INVALID_PARAMS
+        assert "create_posts" in excinfo.value.message
+
+    def test_recreate_rejects_foreign_broadcast(self, context, workspace, youtube_account, provider):
+        row = _broadcast(workspace, youtube_account)
+        from apps.workspaces.models import Workspace as WS
+
+        other_ws = WS.objects.create(name="Other WS", organization=workspace.organization)
+        foreign = LiveBroadcast.objects.create(
+            workspace=other_ws,
+            social_account=youtube_account,
+            broadcast_id="bcast-mcp-foreign",
+            stream_id="stream-mcp-foreign",
+            title="Foreign",
+            status=LiveBroadcast.Status.READY,
+            stream_url="rtmp://a.rtmp.youtube.com/live2",
+            stream_key=LIVE_KEY,
+        )
+        # Out-of-scope and nonexistent both surface as "broadcast not found".
+        with pytest.raises(JsonRpcError) as excinfo:
+            _live_recreate_stream({"broadcast_id": str(foreign.id)}, context)
+        assert excinfo.value.code == INVALID_PARAMS
+        assert "broadcast not found" in excinfo.value.message
+        assert LiveBroadcast.objects.filter(pk=foreign.id).exists()
+        # The allowlisted row still recreates fine.
+        body = _payload(_live_recreate_stream({"broadcast_id": str(row.id)}, context))
+        assert body["stream_key"] == LIVE_KEY
 
 
 @pytest.mark.django_db

@@ -24,6 +24,12 @@ from ninja.errors import HttpError
 
 from apps.analytics.api_builders import build_account_analytics, build_post_analytics
 from apps.api.limits import check_platform_quota
+from apps.api.middleware import (
+    claim_idempotency_slot,
+    finalize_idempotent_response,
+    fingerprint_request,
+    release_idempotent_claim,
+)
 from apps.api.pagination import decode_offset_cursor, encode_offset_cursor
 from apps.api.schemas import LiveBroadcastResponse, PostResponse
 from apps.composer.models import PlatformPost, Post
@@ -38,8 +44,9 @@ from apps.inbox.services import (
 )
 from apps.mcp.protocol import INTERNAL_ERROR, INVALID_PARAMS, JsonRpcError
 from apps.mcp.tools import Tool, register_tool
-from apps.social_accounts import live_service
+from apps.social_accounts import live_service, profile_service
 from apps.social_accounts.live_service import LiveServiceError
+from apps.social_accounts.profile_service import ProfileServiceError
 from apps.social_accounts.models import LiveBroadcast, SocialAccount
 
 # ---------------------------------------------------------------------------
@@ -229,6 +236,138 @@ register_tool(
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         handler=_list_accounts,
         read_only=True,
+    )
+)
+
+
+# ---------------------------------------------------------------------------
+# Tool: account_update_profile
+# ---------------------------------------------------------------------------
+# Same service call as PATCH /api/v1/accounts/{id}/profile (and the web
+# account card): one platform gate, one validation, one provider call.
+# The service owns the platform rules — YouTube description only,
+# Facebook Page about/description/website/phone, TikTok/Instagram refused
+# (their bio can only change in the app), via-Zernio accounts refused
+# (Zernio exposes no profile-update endpoint).
+
+
+def _map_profile_service_error(exc: ProfileServiceError) -> JsonRpcError:
+    """Map a profile-service failure onto a JSON-RPC error.
+
+    Client-side failures (bad input, missing scope, unsupported platform)
+    are INVALID_PARAMS; a platform-side failure is INTERNAL_ERROR — the
+    same split as ``_map_live_service_error``.
+    """
+    code = INVALID_PARAMS if exc.status_code in (400, 403, 422) else INTERNAL_ERROR
+    return JsonRpcError(code, exc.message)
+
+
+# Field length caps mirror the REST ``AccountProfileUpdateRequest`` schema.
+_PROFILE_FIELD_MAX_LENGTHS = {
+    "description": 5000,
+    "about": 255,
+    "website": 2000,
+    "phone": 50,
+}
+
+
+def _account_update_profile(args: dict, context: dict[str, Any]) -> dict:
+    _require_perm(context, "create_posts")
+    api_key = context["api_key"]
+    if "social_account_id" not in args:
+        raise JsonRpcError(INVALID_PARAMS, "social_account_id is required")
+    sa = _resolve_allowed_account(api_key, args["social_account_id"])
+    fields: dict[str, str | None] = {}
+    for name, max_length in _PROFILE_FIELD_MAX_LENGTHS.items():
+        value = args.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise JsonRpcError(INVALID_PARAMS, f"{name} must be a string")
+        if len(value) > max_length:
+            raise JsonRpcError(INVALID_PARAMS, f"{name} must be at most {max_length} characters")
+        fields[name] = value
+    # Mirror the REST route: at least one non-blank field, so a no-op
+    # never spends a platform call. Blank strings count as omitted for
+    # this check; the raw values are still passed through to the service,
+    # exactly like REST passes the raw payload.
+    given = {name: value for name, value in fields.items() if value.strip()}
+    if not given:
+        raise JsonRpcError(
+            INVALID_PARAMS,
+            "Send at least one field to update: description (YouTube), or "
+            "about / description / website / phone (Facebook Page).",
+        )
+    try:
+        updated = profile_service.update_account_profile(
+            sa,
+            description=fields.get("description"),
+            about=fields.get("about"),
+            website=fields.get("website"),
+            phone=fields.get("phone"),
+        )
+    except ProfileServiceError as exc:
+        raise _map_profile_service_error(exc) from exc
+    return _wrap_text(
+        {
+            "id": str(sa.id),
+            "platform": updated["platform"],
+            "transport": updated.get("transport"),
+            "description": updated.get("description"),
+            "about": updated.get("about"),
+            "website": updated.get("website"),
+            "phone": updated.get("phone"),
+            "updated_fields": updated.get("updated_fields", []),
+        }
+    )
+
+
+register_tool(
+    Tool(
+        name="account_update_profile",
+        description=(
+            "Update a connected account's public profile on its platform: a YouTube channel "
+            "description, or a Facebook Page's about / description / website / phone. "
+            "TikTok and Instagram bios can only be changed in their apps, and accounts "
+            "connected via Zernio have no profile-update endpoint — both are refused. "
+            "Send at least one field. Requires the create_posts permission."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "social_account_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "A connected account in this key's allowlist (see list_accounts).",
+                },
+                "description": {
+                    "type": "string",
+                    "maxLength": 5000,
+                    "description": (
+                        "YouTube channel description (also the Page long description for Facebook). "
+                        "YouTube enforces max 1000 characters."
+                    ),
+                },
+                "about": {
+                    "type": "string",
+                    "maxLength": 255,
+                    "description": "Facebook Page short About text. Facebook only.",
+                },
+                "website": {
+                    "type": "string",
+                    "maxLength": 2000,
+                    "description": "Facebook Page website. Must be an http(s) URL. Facebook only.",
+                },
+                "phone": {
+                    "type": "string",
+                    "maxLength": 50,
+                    "description": "Facebook Page phone. Facebook only.",
+                },
+            },
+            "required": ["social_account_id"],
+            "additionalProperties": False,
+        },
+        handler=_account_update_profile,
     )
 )
 
@@ -1693,6 +1832,65 @@ def _live_create(args: dict, context: dict[str, Any]) -> dict:
     scheduled_start = None
     if args.get("scheduled_start") is not None:
         scheduled_start = _parse_iso_datetime(args["scheduled_start"], "scheduled_start")
+    idempotency_key = args.get("idempotency_key")
+    if idempotency_key is not None:
+        if not isinstance(idempotency_key, str):
+            raise JsonRpcError(INVALID_PARAMS, "idempotency_key must be a string")
+        if len(idempotency_key) > 128:
+            raise JsonRpcError(INVALID_PARAMS, "idempotency_key must be at most 128 characters")
+
+    # ---- Atomic claim-first idempotency (same pattern as the REST live
+    # router). Cheap validation above runs BEFORE the claim, so a 422
+    # here never leaves a placeholder claim behind. The claim is taken
+    # before ANY YouTube call, so a sequential retry replays the stored
+    # response (including the same stream key — the retry is the same
+    # logical create) instead of creating a second stream + broadcast
+    # on YouTube. Same key + different body → 422; a concurrent peer
+    # holding the slot → INVALID_PARAMS with the retry-shortly message
+    # (MCP has no 409 code). The fingerprint hashes the normalized
+    # body (defaults filled) under the MCP method namespace —
+    # deliberately distinct from the REST fingerprint, so a key reused
+    # across surfaces with a subtly different wire body is refused as
+    # a different intent rather than replaying the wrong response.
+    # NOTE: ``live_service.create_live_broadcast`` itself takes no
+    # idempotency parameter — the slot lives in the middleware layer,
+    # exactly as on the REST route.
+    fingerprint = fingerprint_request(
+        "MCP",
+        "live_create",
+        {
+            "social_account_id": str(sa.id),
+            "title": args["title"],
+            "description": args.get("description", ""),
+            "privacy_status": args.get("privacy_status", "private"),
+            "resolution": args.get("resolution", "1080p"),
+            "frame_rate": args.get("frame_rate", "30fps"),
+            "scheduled_start": scheduled_start.isoformat() if scheduled_start is not None else None,
+            "idempotency_key": idempotency_key,
+        },
+    )
+    try:
+        disposition, _replay_status, replay_body = claim_idempotency_slot(
+            api_key=api_key,
+            idempotency_key=idempotency_key,
+            fingerprint=fingerprint,
+        )
+    except ValueError as exc:
+        raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
+    if disposition == "replay":
+        return _wrap_text(replay_body)
+    if disposition == "in_flight":
+        raise JsonRpcError(
+            INVALID_PARAMS,
+            "An identical request with this idempotency_key is still in flight; retry shortly.",
+        )
+
+    # Only the failure of the service call itself releases the claim:
+    # on failure the service has already cleaned up the half-created
+    # YouTube pair, so a retry can safely create fresh. Once the
+    # service returns, the claim is NEVER released again — a later
+    # failure leaves the slot PENDING, so a retry gets "in flight"
+    # instead of creating a second broadcast on YouTube.
     try:
         broadcast, stream_key = live_service.create_live_broadcast(
             api_key.workspace,
@@ -1705,12 +1903,23 @@ def _live_create(args: dict, context: dict[str, Any]) -> dict:
             scheduled_start=scheduled_start,
         )
     except LiveServiceError as exc:
+        release_idempotent_claim(api_key=api_key, idempotency_key=idempotency_key)
         raise _map_live_service_error(exc) from exc
+    except Exception:
+        release_idempotent_claim(api_key=api_key, idempotency_key=idempotency_key)
+        raise
     # The create response discloses the key exactly once, mirroring the
     # web created-page: mark it shown before serializing so the response
     # is truthful about ``key_shown``.
     live_service.mark_key_shown(broadcast)
-    return _wrap_text(_serialize_live_broadcast(broadcast, stream_key=stream_key))
+    body = _serialize_live_broadcast(broadcast, stream_key=stream_key)
+    finalize_idempotent_response(
+        api_key=api_key,
+        idempotency_key=idempotency_key,
+        status_code=201,
+        body=body,
+    )
+    return _wrap_text(body)
 
 
 register_tool(
@@ -1723,6 +1932,8 @@ register_tool(
             "return the masked key. Nothing goes live until live_transition with action "
             "'go_live'. The target account needs the full youtube OAuth scope — an upload-only "
             "grant fails until the account is reconnected for Live from the web monitor. "
+            "Pass idempotency_key to make retries safe: the same key + same body replays the "
+            "first response instead of creating a second broadcast. "
             "Requires the create_posts permission."
         ),
         input_schema={
@@ -1749,6 +1960,15 @@ register_tool(
                 "scheduled_start": {
                     "type": "string",
                     "description": "Optional scheduled start, ISO 8601. A tz-less value is read as UTC.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "description": (
+                        "Optional client-chosen retry key. Same key + same body replays the first "
+                        "response (including the same stream key) instead of creating a second "
+                        "broadcast on YouTube; same key + different body is refused."
+                    ),
                 },
             },
             "required": ["social_account_id", "title"],
@@ -1923,5 +2143,47 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_live_delete,
+    )
+)
+
+
+def _live_recreate_stream(args: dict, context: dict[str, Any]) -> dict:
+    # Thin wrap of the REST recreate-stream endpoint's service call:
+    # the old stream is deleted on YouTube and a fresh one created and
+    # bound — the only way to reset a stream key. Only while the
+    # broadcast is still ready/testing; the service refuses it once
+    # live. The new key is disclosed exactly once here, like create.
+    _require_perm(context, "create_posts")
+    api_key = context["api_key"]
+    if "broadcast_id" not in args:
+        raise JsonRpcError(INVALID_PARAMS, "broadcast_id is required")
+    broadcast = _resolve_live_broadcast(api_key, args["broadcast_id"])
+    try:
+        broadcast, stream_key = live_service.recreate_live_stream(broadcast)
+    except LiveServiceError as exc:
+        raise _map_live_service_error(exc) from exc
+    live_service.mark_key_shown(broadcast)
+    return _wrap_text(_serialize_live_broadcast(broadcast, stream_key=stream_key))
+
+
+register_tool(
+    Tool(
+        name="live_recreate_stream",
+        description=(
+            "Replace a YouTube live broadcast's ingest stream with a fresh one (new stream "
+            "key). Only while the broadcast is still ready or testing — never once live. "
+            "Returns the broadcast with the FULL new stream key, shown exactly once here, "
+            "so copy it into OBS immediately; later calls only ever return the masked key. "
+            "Requires the create_posts permission."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "broadcast_id": {"type": "string", "format": "uuid"},
+            },
+            "required": ["broadcast_id"],
+            "additionalProperties": False,
+        },
+        handler=_live_recreate_stream,
     )
 )
