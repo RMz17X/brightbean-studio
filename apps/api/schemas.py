@@ -145,6 +145,8 @@ class MeResponse(Schema):
 
 class AccountsListResponse(Schema):
     accounts: list[AccountSummary]
+    limit: int
+    next_cursor: str | None = None
 
 
 class AccountProfileUpdateRequest(Schema):
@@ -223,6 +225,38 @@ class PlatformOverride(Schema):
     title: str | None = Field(None, max_length=255)
     caption: str | None = Field(None, max_length=10_000)
     first_comment: str | None = Field(None, max_length=10_000)
+
+
+def _clean_youtube_tags(value: list[str] | None) -> list[str] | None:
+    """Enforce YouTube's tag caps (same bounds as ``apps/common/validators.py``).
+
+    At most 30 tags, each 1-50 chars after trimming, 500 chars total
+    including separators. Blank entries are rejected; duplicates are
+    dropped, order kept. Violations raise ``ValueError`` → 422.
+    Shared by create and PATCH so the two surfaces accept exactly the
+    same tags.
+    """
+    if value is None:
+        return None
+    if len(value) > 30:
+        raise ValueError("tags accepts at most 30 entries.")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    total = 0
+    for raw in value:
+        tag = raw.strip()
+        if not tag:
+            raise ValueError("tags must not contain blank entries.")
+        if len(tag) > 50:
+            raise ValueError("each tag must be at most 50 characters.")
+        if tag in seen:
+            continue
+        total += len(tag) + (1 if cleaned else 0)
+        if total > 500:
+            raise ValueError("tags must total at most 500 characters including separators.")
+        seen.add(tag)
+        cleaned.append(tag)
+    return cleaned
 
 
 class CreatePostRequest(Schema):
@@ -313,33 +347,7 @@ class CreatePostRequest(Schema):
     @field_validator("tags")
     @classmethod
     def _validate_youtube_tags(cls, value: list[str] | None) -> list[str] | None:
-        """Enforce YouTube's tag caps (same bounds as ``apps/common/validators.py``).
-
-        At most 30 tags, each 1-50 chars after trimming, 500 chars total
-        including separators. Blank entries are rejected; duplicates are
-        dropped, order kept. Violations raise ``ValueError`` → 422.
-        """
-        if value is None:
-            return None
-        if len(value) > 30:
-            raise ValueError("tags accepts at most 30 entries.")
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        total = 0
-        for raw in value:
-            tag = raw.strip()
-            if not tag:
-                raise ValueError("tags must not contain blank entries.")
-            if len(tag) > 50:
-                raise ValueError("each tag must be at most 50 characters.")
-            if tag in seen:
-                continue
-            total += len(tag) + (1 if cleaned else 0)
-            if total > 500:
-                raise ValueError("tags must total at most 500 characters including separators.")
-            seen.add(tag)
-            cleaned.append(tag)
-        return cleaned
+        return _clean_youtube_tags(value)
     platform_overrides: list[PlatformOverride] = Field(
         default_factory=list,
         description=(
@@ -371,11 +379,41 @@ class CreatePostRequest(Schema):
     idempotency_key: str | None = Field(
         None,
         max_length=128,
-        description="Optional client-chosen retry key. Same key + same body → replay first response.",
+        description=(
+            "Optional client-chosen retry key. When both this field and the "
+            "`Idempotency-Key` header are sent, this field wins. Same key + same "
+            "body → the first response is replayed verbatim; same key + different "
+            "body → 422; a concurrent request holding the same key → 409. "
+            "Keys live 24h and are scoped to this API key."
+        ),
     )
 
 
 class UpdatePostRequest(Schema):
+    """Body for ``PATCH /posts/{id}``.
+
+    Every field is optional; ``null`` (or omitted) leaves the field
+    unchanged — the one exception is ``tags``, where an empty list ``[]``
+    clears the stored tags. Only posts whose aggregate status is editable
+    (draft / scheduled / review states — never published) accept a PATCH;
+    anything else answers 409.
+
+    The YouTube-only fields (``privacy_status``, ``tags``,
+    ``thumbnail_asset_id``, ``category_id``, ``made_for_kids``) apply to
+    the post's YouTube-destination platform children only, and only while
+    those children are still editable (draft / scheduled). The publisher
+    reads them from the child at publish time, so a PATCH before publish
+    takes effect. Sending any of them when the post has no YouTube child
+    answers 422, and so does a ``thumbnail_asset_id`` that is not a media
+    asset in this workspace. On a YouTube child routed via Zernio,
+    ``category_id`` / ``made_for_kids`` / ``thumbnail_asset_id`` answer
+    422 (Zernio has no such fields — only ``privacy_status`` and ``tags``
+    survive there); the other two fields keep the create-time contract.
+    There is no way to clear ``thumbnail_asset_id`` / ``category_id`` via
+    PATCH (``null`` is a no-op everywhere here); send the provider default
+    ``category_id`` ``"22"`` to neutralise a custom category.
+    """
+
     caption: str | None = Field(None, max_length=10_000)
     title: str | None = Field(None, max_length=255)
     first_comment: str | None = Field(None, max_length=10_000)
@@ -393,6 +431,44 @@ class UpdatePostRequest(Schema):
         None,
         description="Set a draft's suggested publish time (UTC). Sending null is a no-op (cannot clear via PATCH).",
     )
+    # --- YouTube-only options (same bounds as CreatePostRequest) ---
+    privacy_status: Literal["public", "unlisted", "private"] | None = Field(
+        None,
+        description="YouTube privacy_status for the post's YouTube children. Omitted → unchanged.",
+    )
+    tags: list[str] | None = Field(
+        None,
+        description=(
+            "YouTube video tags (same caps as create: at most 30, each 1-50 chars, "
+            "500 chars total). An empty list clears the stored tags."
+        ),
+    )
+    thumbnail_asset_id: uuid.UUID | None = Field(
+        None,
+        description=(
+            "MediaAsset ID (image) in this workspace to upload as the YouTube custom "
+            "thumbnail. Must exist in the same workspace — otherwise 422. "
+            "Not available via Zernio (422). Cannot be cleared via PATCH."
+        ),
+    )
+    category_id: str | None = Field(
+        None,
+        max_length=10,
+        pattern=r"^[0-9]+$",
+        description=(
+            'YouTube categoryId (numeric string, e.g. "22" = People & Blogs). '
+            "Not available via Zernio (422)."
+        ),
+    )
+    made_for_kids: bool | None = Field(
+        None,
+        description="YouTube selfDeclaredMadeForKids. Not available via Zernio (422).",
+    )
+
+    @field_validator("tags")
+    @classmethod
+    def _validate_youtube_tags(cls, value: list[str] | None) -> list[str] | None:
+        return _clean_youtube_tags(value)
 
 
 class ScheduleRequest(Schema):
@@ -414,6 +490,17 @@ class PlatformPostSummary(Schema):
     published_at: dt.datetime | None
     platform_post_id: str = ""
     publish_error: str = ""
+    # YouTube-only options as stored on this child (``platform_extra``).
+    # ``None`` / empty means "not set — the provider default applies at
+    # publish time" (public, no tags, no thumbnail, category "22", not made
+    # for kids). Always ``None`` / empty for non-YouTube children. Set at
+    # create time and editable via ``PATCH /posts/{id}`` while the child is
+    # still draft / scheduled.
+    youtube_privacy_status: str | None = None
+    youtube_tags: list[str] = Field(default_factory=list)
+    youtube_thumbnail_asset_id: uuid.UUID | None = None
+    youtube_category_id: str | None = None
+    youtube_made_for_kids: bool | None = None
 
     @field_serializer("scheduled_at", "published_at")
     def _serialize_dt(self, value: dt.datetime | None) -> str | None:
@@ -421,6 +508,12 @@ class PlatformPostSummary(Schema):
 
     @classmethod
     def from_platform_post(cls, pp: PlatformPost) -> PlatformPostSummary:
+        extra = pp.platform_extra or {}
+        thumb_raw = extra.get("thumbnail_asset_id")
+        try:
+            thumb_id = uuid.UUID(str(thumb_raw)) if thumb_raw else None
+        except (ValueError, TypeError, AttributeError):
+            thumb_id = None
         return cls(
             id=pp.id,
             social_account_id=pp.social_account_id,
@@ -431,6 +524,11 @@ class PlatformPostSummary(Schema):
             published_at=pp.published_at,
             platform_post_id=pp.platform_post_id or "",
             publish_error=pp.publish_error or "",
+            youtube_privacy_status=extra.get("privacy_status"),
+            youtube_tags=list(extra.get("tags") or []),
+            youtube_thumbnail_asset_id=thumb_id,
+            youtube_category_id=extra.get("category_id"),
+            youtube_made_for_kids=extra.get("self_declared_made_for_kids"),
         )
 
 
@@ -493,6 +591,21 @@ class PostResponse(Schema):
             created_at=post.created_at,
             updated_at=post.updated_at,
         )
+
+
+class PostsListResponse(Schema):
+    """``GET /posts/`` — workspace posts visible to this key, newest first.
+
+    A post is listed only when every one of its platform children targets
+    an account in the key's allowlist (same rule as ``GET /posts/{id}``);
+    posts with no children are never listed. ``status`` matches on the
+    per-platform child status (identical to the aggregate status for the
+    single-child posts the API creates).
+    """
+
+    posts: list[PostResponse]
+    limit: int
+    next_cursor: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -985,7 +1098,13 @@ class CreateReplyRequest(Schema):
     idempotency_key: str | None = Field(
         None,
         max_length=128,
-        description="Optional client-chosen retry key. Same key + same body → replay first response.",
+        description=(
+            "Optional client-chosen retry key. When both this field and the "
+            "`Idempotency-Key` header are sent, this field wins. Same key + same "
+            "body → the first response is replayed verbatim; same key + different "
+            "body → 422; a concurrent request holding the same key → 409. "
+            "Keys live 24h and are scoped to this API key."
+        ),
     )
     send: bool = Field(
         False,
@@ -1050,7 +1169,14 @@ class LiveBroadcastCreateRequest(Schema):
     idempotency_key: str | None = Field(
         None,
         max_length=128,
-        description="Optional client-chosen retry key. Same key + same body → replay first response.",
+        description=(
+            "Optional client-chosen retry key. When both this field and the "
+            "`Idempotency-Key` header are sent, this field wins. Same key + same "
+            "body → the first response is replayed verbatim (including the same "
+            "stream key — the retry is the same logical create); same key + "
+            "different body → 422; a concurrent request holding the same key → "
+            "409. Keys live 24h and are scoped to this API key."
+        ),
     )
 
 

@@ -9,11 +9,12 @@ from __future__ import annotations
 import uuid
 
 from django.http import HttpRequest
-from ninja import Router
+from ninja import Query, Router
 from ninja.errors import HttpError
 
 from apps.api.limits import enforce_http_rate_limits
 from apps.api.middleware import log_audit_entry
+from apps.api.pagination import decode_offset_cursor, encode_offset_cursor
 from apps.api.schemas import (
     AccountProfileResponse,
     AccountProfileUpdateRequest,
@@ -57,16 +58,34 @@ def _resolve_allowed_account(request: HttpRequest, account_id: uuid.UUID) -> Soc
     "/",
     response=AccountsListResponse,
     summary="List the SocialAccounts this API key is allowed to act on",
+    description=(
+        "Cursor pagination like every other list endpoint: `limit` (1-100, "
+        "default 50) and the `next_cursor` from the previous page. The list "
+        "is bounded by the key's allowlist, so a single page normally holds "
+        "all of them."
+    ),
 )
-def list_accounts(request):
+def list_accounts(request, limit: int = Query(50, ge=1, le=100), cursor: str | None = Query(None)):
     enforce_http_rate_limits(request, is_write=False)
+    try:
+        offset = decode_offset_cursor(cursor)
+    except ValueError as exc:
+        raise HttpError(422, "cursor is not a valid pagination cursor") from exc
     api_key = request.api_key
-    accounts = [
-        AccountSummary.from_social_account(sa)
-        for sa in api_key.social_accounts.prefetch_related("zernio_binding").all()
-    ]
+    # Explicit order (name + id tiebreak) so cursor pages are stable.
+    all_accounts = list(
+        api_key.social_accounts.order_by("account_name", "id").prefetch_related("zernio_binding").all()
+    )
+    page = all_accounts[offset : offset + limit + 1]
+    has_more = len(page) > limit
+    page = page[:limit]
+    accounts = [AccountSummary.from_social_account(sa) for sa in page]
     log_audit_entry(request, action="accounts.list", target_id=None, status_code=200)
-    return AccountsListResponse(accounts=accounts)
+    return AccountsListResponse(
+        accounts=accounts,
+        limit=limit,
+        next_cursor=encode_offset_cursor(offset + limit) if has_more else None,
+    )
 
 
 @router.patch(

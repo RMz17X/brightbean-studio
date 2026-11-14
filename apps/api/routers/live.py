@@ -140,7 +140,18 @@ def _map_service_error(exc: LiveServiceError) -> HttpError:
 # ---------------------------------------------------------------------------
 
 
-@router.post("/", response={201: LiveBroadcastResponse}, summary="Create a live broadcast")
+@router.post(
+    "/",
+    response={201: LiveBroadcastResponse},
+    summary="Create a live broadcast",
+    description=(
+        "Idempotency: `idempotency_key` in the body wins over the "
+        "`Idempotency-Key` header when both are sent. Same key + same body → "
+        "the first 201 is replayed verbatim, including the same stream key; "
+        "same key + different body → 422; a concurrent create holding the same "
+        "key → 409. Keys live 24h and are scoped to this API key."
+    ),
+)
 def create_live(request, payload: LiveBroadcastCreateRequest):
     enforce_http_rate_limits(request, is_write=True)
     _require_perm(request, "create_posts")

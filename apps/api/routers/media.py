@@ -76,6 +76,14 @@ def _parse_tags_csv(value: str | None) -> list[str]:
     "/",
     response={201: MediaAssetResponse},
     summary="Upload a new media asset (multipart/form-data)",
+    description=(
+        "Idempotency: send `idempotency_key` as a form field, or the "
+        "`Idempotency-Key` header — the form field wins when both are sent. "
+        "Same key + same upload (filename, size, and form fields — the file "
+        "bytes themselves are not hashed) → the first 201 is replayed; same "
+        "key + different upload → 422; a concurrent upload holding the same "
+        "key → 409. Keys live 24h and are scoped to this API key."
+    ),
 )
 def upload(
     request,
@@ -84,7 +92,14 @@ def upload(
     title: str = Form(""),
     folder_id: uuid.UUID | None = Form(None),
     tags: str = Form(""),
-    idempotency_key: str | None = Form(None),
+    idempotency_key: str | None = Form(
+        None,
+        description=(
+            "Optional client-chosen retry key. Wins over the `Idempotency-Key` "
+            "header when both are sent. Same key + same upload → replay; same "
+            "key + different upload → 422; concurrent holder → 409."
+        ),
+    ),
 ):
     """Upload a binary into the workspace's media library.
 

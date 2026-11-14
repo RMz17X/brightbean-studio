@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import uuid
 
+from django.db.models import Count
 from django.http import HttpRequest
 from django.shortcuts import get_object_or_404
-from ninja import Router
+from ninja import Query, Router
 from ninja.errors import HttpError
 
 from apps.api.limits import check_platform_quota, enforce_http_rate_limits
@@ -33,13 +34,15 @@ from apps.api.middleware import (
     log_audit_entry,
     release_idempotent_claim,
 )
+from apps.api.pagination import decode_offset_cursor, encode_offset_cursor
 from apps.api.schemas import (
     CreatePostRequest,
     PostResponse,
+    PostsListResponse,
     ScheduleRequest,
     UpdatePostRequest,
 )
-from apps.composer.models import Post
+from apps.composer.models import PlatformPost, Post
 from apps.composer.services import (
     create_post,
     media_change_blocker,
@@ -141,7 +144,19 @@ def _get_workspace_post(request: HttpRequest, post_id: uuid.UUID) -> Post:
 # ---------------------------------------------------------------------------
 
 
-@router.post("/", response={201: PostResponse, 200: PostResponse}, summary="Create a draft or scheduled post")
+@router.post(
+    "/",
+    response={201: PostResponse, 200: PostResponse},
+    summary="Create a draft or scheduled post",
+    description=(
+        "Idempotency: `idempotency_key` in the body wins over the "
+        "`Idempotency-Key` header when both are sent. Same key + same body → "
+        "the first response is replayed verbatim; same key + different body → "
+        "422; a concurrent request holding the same key → 409. Keys live 24h "
+        "and are scoped to this API key. `action: schedule` requires "
+        "`scheduled_at` and the `publish_directly` permission."
+    ),
+)
 def create(request, payload: CreatePostRequest):
     enforce_http_rate_limits(request, is_write=True)
     _require_perm(request, "create_posts")
@@ -293,6 +308,71 @@ def create(request, payload: CreatePostRequest):
     return status_code, body
 
 
+@router.get(
+    "/",
+    response=PostsListResponse,
+    summary="List posts visible to this key",
+    description=(
+        "Newest first. Cursor pagination: pass `limit` (1-100, default 50) and the "
+        "`next_cursor` from the previous page. `status` matches the per-platform "
+        "child status (identical to the aggregate status for the single-child "
+        "posts the API creates). `social_account_id` must be in this key's "
+        "allowlist (403 otherwise). A post is listed only when every one of its "
+        "platform children is allowlisted — the same visibility rule as "
+        "`GET /posts/{id}`."
+    ),
+)
+def list_posts(
+    request,
+    status: str | None = Query(None, description="Filter by platform-post status, e.g. draft, scheduled, published."),
+    social_account_id: uuid.UUID | None = Query(None),
+    limit: int = Query(50, ge=1, le=100),
+    cursor: str | None = Query(None),
+):
+    enforce_http_rate_limits(request, is_write=False)
+    if status is not None and status not in PlatformPost.Status.values:
+        raise HttpError(422, f"status must be one of {', '.join(PlatformPost.Status.values)}")
+    try:
+        offset = decode_offset_cursor(cursor)
+    except ValueError as exc:
+        raise HttpError(422, "cursor is not a valid pagination cursor") from exc
+    allowed_ids = {sa.id for sa in request.api_key.social_accounts.all()}  # type: ignore[attr-defined]
+    if social_account_id is not None and social_account_id not in allowed_ids:
+        raise HttpError(403, "social_account_id is not in this key's allowlist.")
+    if not allowed_ids:
+        return PostsListResponse(posts=[], limit=limit, next_cursor=None)
+
+    # Visibility: exclude any post with a child outside the allowlist, and
+    # posts with no children at all (same rule as ``_get_workspace_post``).
+    foreign_post_ids = (
+        PlatformPost.objects.filter(post__workspace_id=request.api_key.workspace_id)  # type: ignore[attr-defined]
+        .exclude(social_account_id__in=allowed_ids)
+        .values_list("post_id", flat=True)
+    )
+    qs = (
+        Post.objects.filter(workspace_id=request.api_key.workspace_id)  # type: ignore[attr-defined]
+        .exclude(id__in=foreign_post_ids)
+        .annotate(_n_children=Count("platform_posts"))
+        .filter(_n_children__gt=0)
+        .prefetch_related("platform_posts__social_account__zernio_binding")
+    )
+    if status:
+        qs = qs.filter(platform_posts__status=status).distinct()
+    if social_account_id is not None:
+        qs = qs.filter(platform_posts__social_account_id=social_account_id).distinct()
+    qs = qs.order_by("-created_at", "id")
+
+    rows = list(qs[offset : offset + limit + 1])
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    log_audit_entry(request, action="post.list", target_id=None, status_code=200)
+    return PostsListResponse(
+        posts=[_post_to_response(request, p) for p in rows],
+        limit=limit,
+        next_cursor=encode_offset_cursor(offset + limit) if has_more else None,
+    )
+
+
 @router.get("/{post_id}", response=PostResponse, summary="Read a single post")
 def retrieve(request, post_id: uuid.UUID):
     enforce_http_rate_limits(request, is_write=False)
@@ -301,7 +381,22 @@ def retrieve(request, post_id: uuid.UUID):
     return _post_to_response(request, post)
 
 
-@router.patch("/{post_id}", response=PostResponse, summary="Update draft fields")
+@router.patch(
+    "/{post_id}",
+    response=PostResponse,
+    summary="Update draft fields",
+    description=(
+        "Partial update of an editable post (draft / scheduled / review states; "
+        "published answers 409). All fields are optional; `null` leaves a field "
+        "unchanged, except `tags: []` which clears the stored YouTube tags. "
+        "YouTube-only fields (`privacy_status`, `tags`, `thumbnail_asset_id`, "
+        "`category_id`, `made_for_kids`) apply to the post's YouTube-destination "
+        "children while they are still draft / scheduled — the publisher reads "
+        "them at publish time. Sending one with no YouTube child answers 422; "
+        "`category_id` / `made_for_kids` / `thumbnail_asset_id` on a Zernio-routed "
+        "YouTube child also answer 422."
+    ),
+)
 def update(request, post_id: uuid.UUID, payload: UpdatePostRequest):
     enforce_http_rate_limits(request, is_write=True)
     _require_perm(request, "create_posts")  # mirrors composer's create-or-edit perm
@@ -358,6 +453,58 @@ def update(request, post_id: uuid.UUID, payload: UpdatePostRequest):
         if reason:
             raise HttpError(422, reason)
 
+    # ---- YouTube options (validate-everything-first, same as media).
+    # The publisher reads ``PlatformPost.platform_extra`` at publish time
+    # (see ``apps/publisher/engine.py``), so updating the extra of a
+    # draft/scheduled YouTube child here takes effect without touching
+    # the state machine — published/publishing children are history and
+    # are never rewritten.
+    yt_children: list = []
+    yt_requested = any(
+        value is not None
+        for value in (
+            payload.privacy_status,
+            payload.tags,
+            payload.thumbnail_asset_id,
+            payload.category_id,
+            payload.made_for_kids,
+        )
+    )
+    if yt_requested:
+        yt_children = [
+            pp for pp in post.platform_posts.all() if pp.social_account.display_platform == "youtube"
+        ]
+        if not yt_children:
+            raise HttpError(422, "This post has no YouTube destination; YouTube options cannot be patched.")
+        yt_children = [pp for pp in yt_children if pp.status not in ("published", "publishing")]
+        if not yt_children:
+            raise HttpError(422, "No editable YouTube platform post on this post.")
+        # Zernio carries no thumbnail / category / made-for-kids field:
+        # an explicit PATCH of one must fail loudly instead of silently
+        # no-op-ing. (Create drops them; a PATCH exists only to change
+        # the field it names, so silent-drop would be a lie.)
+        zernio_blocked = [
+            name
+            for name, value in (
+                ("thumbnail_asset_id", payload.thumbnail_asset_id),
+                ("category_id", payload.category_id),
+                ("made_for_kids", payload.made_for_kids),
+            )
+            if value is not None
+        ]
+        if zernio_blocked and any(pp.social_account.is_via_zernio for pp in yt_children):
+            raise HttpError(
+                422,
+                f"{', '.join(zernio_blocked)} is not available for YouTube accounts routed via Zernio.",
+            )
+        if payload.thumbnail_asset_id is not None:
+            thumb = MediaAsset.objects.filter(id=payload.thumbnail_asset_id, workspace=post.workspace).first()
+            if thumb is None:
+                raise HttpError(
+                    422,
+                    f"Thumbnail asset {payload.thumbnail_asset_id} not found in workspace {post.workspace_id}.",
+                )
+
     with transaction.atomic():
         update_fields: list[str] = []
         if payload.caption is not None:
@@ -405,6 +552,37 @@ def update(request, post_id: uuid.UUID, payload: UpdatePostRequest):
 
         if update_fields:
             post.save(update_fields=[*update_fields, "updated_at"])
+
+        if yt_children:
+            # YouTube options live in each child's ``platform_extra`` —
+            # the same dict ``create_post`` writes and the publisher
+            # reads at publish time. ``tags: []`` clears the stored tags;
+            # every other field only writes when sent (null = no-op).
+            for pp in yt_children:
+                extra = dict(pp.platform_extra or {})
+                if payload.privacy_status is not None:
+                    extra["privacy_status"] = payload.privacy_status
+                if payload.tags is not None:
+                    if payload.tags:
+                        extra["tags"] = list(payload.tags)
+                    else:
+                        extra.pop("tags", None)
+                if payload.thumbnail_asset_id is not None:
+                    extra["thumbnail_asset_id"] = str(payload.thumbnail_asset_id)
+                if payload.category_id is not None:
+                    extra["category_id"] = payload.category_id
+                if payload.made_for_kids is not None:
+                    extra["self_declared_made_for_kids"] = payload.made_for_kids
+                pp.platform_extra = extra
+                pp.save(update_fields=["platform_extra", "updated_at"])
+            if not update_fields:
+                # A YouTube-only PATCH changes PlatformPost rows, not the
+                # Post row — still bump the post's updated_at so
+                # "modified since" syncs see the change.
+                from django.utils import timezone as _tz
+
+                post.updated_at = _tz.now()
+                post.save(update_fields=["updated_at"])
 
         sync_post_scheduled_at(post)
 

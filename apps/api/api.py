@@ -14,7 +14,7 @@ from typing import Any
 from django.conf import settings
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from ninja import NinjaAPI
-from ninja.errors import AuthenticationError, HttpError
+from ninja.errors import AuthenticationError, HttpError, ValidationError
 from ninja.openapi.docs import Swagger
 
 from apps.api.auth import ApiKeyAuth, McpAuth
@@ -100,7 +100,47 @@ api = NinjaAPI(
         "(Zernio has no such endpoint) and answers 422; TikTok and "
         "Instagram bios can only be changed in their apps and answer 422. "
         "A YouTube token without the full scope answers 403 — reconnect "
-        "the account for Live from the web monitor."
+        "the account for Live from the web monitor.\n\n"
+        "**API standards (v1).**\n\n"
+        "**URLs.** Collections use a trailing slash and item detail does not: "
+        "`GET /posts/` lists, `GET /posts/{id}` reads one; the same holds for "
+        "`/live/`, `/media/`, `/inbox/`, `/accounts/`, and `/me/`. The form is "
+        "frozen — clients may rely on it. Action sub-paths (`/schedule`, "
+        "`/cancel`, `/transition`, `/recreate-stream`, `/send`, `/replies`, "
+        "`/profile`) never carry a trailing slash.\n\n"
+        "**Errors.** Every 4xx/5xx answers one envelope: "
+        "`{\"error\": \"<slug>\", \"detail\": \"<human-readable>\"}`. Slugs: "
+        "`bad_request` (400), `unauthorized` (401), `forbidden` (403), "
+        "`not_found` (404), `conflict` (409), `payload_too_large` (413), "
+        "`unprocessable_entity` (422), `rate_limited` (429 — plus `tier`, "
+        "`limit`, `remaining`, `retry_after` and a `Retry-After` header), "
+        "`bad_gateway` (502), `storage_quota_exceeded` (413 — plus "
+        "`used_bytes` / `limit_bytes` / `attempted_bytes`). 400 is reserved "
+        "for a missing confirmation (going live on a public broadcast); "
+        "every other client error is 422. Validation failures (bad JSON, bad "
+        "query values, out-of-range fields) are 422 in the same envelope. "
+        "403 covers both a missing workspace permission and an account "
+        "outside the key's allowlist; 404 is also returned for IDs that "
+        "exist in another workspace, so the API never leaks foreign IDs.\n\n"
+        "**Pagination.** Every list endpoint takes `limit` (1-100, default "
+        "50 — except `/media/`, which defaults to 20) and an opaque `cursor`. "
+        "Responses carry `limit` and `next_cursor` (`null` on the last page). "
+        "A malformed cursor is 422.\n\n"
+        "**Idempotency.** Every POST that creates a resource (`/posts/`, "
+        "`/live/`, `/media/`, `/inbox/{id}/replies`) accepts an "
+        "`idempotency_key` in the body (a form field for `/media/`) and an "
+        "`Idempotency-Key` header; the body field wins when both are sent. "
+        "Same key + same body replays the first response verbatim; same key "
+        "+ different body is 422; a concurrent request holding the key is "
+        "409. Keys live 24h and are scoped to the API key.\n\n"
+        "**Auth.** `Authorization: Bearer bb_studio_…` on every call. A "
+        "missing, revoked, or expired key answers 401 "
+        "`{\"error\": \"unauthorized\", ...}` with no further detail. "
+        "Workspace scope comes from the bearer, never from the request body.\n\n"
+        "**Routing.** `platform` is always the destination (TikTok, "
+        "YouTube, …); `transport` names how a publish travels for that "
+        "account (`\"zernio\"` or null for a direct connection) — routing "
+        "follows the account, not the platform."
     ),
     auth=ApiKeyAuth(),
     docs=NoncedSwagger(),
@@ -309,17 +349,44 @@ def _action_for_path(method: str, path: str, *, status_code: int) -> str:
     return f"unknown.{method.lower()}.{status_code}"
 
 
+@api.exception_handler(ValidationError)
+def _validation_error_handler(request: HttpRequest, exc: ValidationError) -> HttpResponse:
+    """Unify Ninja's 422 validation errors with the ``{"error", "detail"}`` envelope.
+
+    Ninja's default is ``{"detail": [{loc, msg, type}, ...]}`` — a different
+    shape from every ``HttpError`` this API raises, so a client parsing
+    errors had to handle two shapes for the same status code. Flatten the
+    error list into one readable ``detail`` string; the slug matches the
+    ``HttpError(422)`` path.
+    """
+    parts: list[str] = []
+    for err in exc.errors or []:
+        loc = err.get("loc") or ()
+        # loc looks like ("body", "caption") / ("query", "limit") — drop the
+        # leading section name, keep the field path.
+        field = ".".join(str(p) for p in loc[1:] if p != "__root__") if len(loc) > 1 else ""
+        msg = err.get("msg") or "invalid value"
+        parts.append(f"{field}: {msg}" if field else str(msg))
+    detail = "; ".join(parts) if parts else "Validation failed."
+    _audit_failed_request(request, status_code=422)
+    return JsonResponse({"error": "unprocessable_entity", "detail": detail}, status=422)
+
+
 def _slug_for(status: int) -> str:
     return {
         400: "bad_request",
         401: "unauthorized",
         403: "forbidden",
         404: "not_found",
+        405: "method_not_allowed",
         409: "conflict",
         413: "payload_too_large",
         415: "unsupported_media_type",
         422: "unprocessable_entity",
         429: "rate_limited",
+        500: "internal_error",
+        502: "bad_gateway",
+        503: "service_unavailable",
     }.get(status, "error")
 
 

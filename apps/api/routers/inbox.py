@@ -152,6 +152,13 @@ def retrieve_message(request, message_id: uuid.UUID):
     "/{message_id}/replies",
     response={201: InboxReplyResponse},
     summary="Create a draft reply (optionally send it)",
+    description=(
+        "Idempotency: `idempotency_key` in the body wins over the "
+        "`Idempotency-Key` header when both are sent. Same key + same body → "
+        "the first response is replayed verbatim; same key + different body → "
+        "422; a concurrent request holding the same key → 409. Keys live 24h "
+        "and are scoped to this API key."
+    ),
 )
 def create_reply(request, message_id: uuid.UUID, payload: CreateReplyRequest):
     enforce_http_rate_limits(request, is_write=True)
