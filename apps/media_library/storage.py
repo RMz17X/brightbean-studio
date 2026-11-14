@@ -188,7 +188,18 @@ def head_object_size(storage_key: str) -> int | None:
 
     ``None`` means the agent never completed the upload — the caller turns that
     into a clear "upload not found" error.
+
+    Local-filesystem deployments read the size off ``default_storage``
+    instead of boto3 (there is no S3 client there at all).
     """
+    if not is_s3_backend():
+        try:
+            if not default_storage.exists(storage_key):
+                return None
+            return int(default_storage.size(storage_key))
+        except (FileNotFoundError, OSError):
+            return None
+
     from botocore.exceptions import ClientError
 
     client, bucket = _client_and_bucket()
@@ -252,7 +263,15 @@ def open_object_range(storage_key: str, start: int | None = None, end: int | Non
 
 
 def read_object_head_bytes(storage_key: str, n: int = 32) -> bytes:
-    """Range-GET the first ``n`` bytes for server-side magic-byte sniffing."""
+    """Range-GET the first ``n`` bytes for server-side magic-byte sniffing.
+
+    Local-filesystem deployments read them off ``default_storage`` instead
+    of boto3. Raises ``FileNotFoundError`` when the object is gone.
+    """
+    if not is_s3_backend():
+        with default_storage.open(storage_key, "rb") as f:
+            return f.read(n)
+
     client, bucket = _client_and_bucket()
     resp = client.get_object(Bucket=bucket, Key=_normalize(storage_key), Range=f"bytes=0-{n - 1}")
     return resp["Body"].read()
@@ -264,3 +283,66 @@ def delete_object(storage_key: str) -> None:
     Delegates to ``default_storage`` so the same key normalization applies.
     """
     default_storage.delete(storage_key)
+
+
+# ---------------------------------------------------------------------------
+# S3 Multipart Upload seam (chunked/resumable uploads, v1.2.0)
+# ---------------------------------------------------------------------------
+#
+# Same pattern as the presigned-POST seam above: one boto3 client via
+# ``_client_and_bucket()``, keys via ``_normalize()``. These are the
+# monkeypatch points the test suite swaps in — no caller outside this
+# module imports boto3. There is deliberately no local-filesystem branch
+# here: on local deployments the server-append path never calls them
+# (``services.init_chunked_upload`` picks the mode from ``is_s3_backend()``).
+
+
+def create_multipart_upload(storage_key: str, *, content_type: str) -> str:
+    """Start an S3 multipart upload; return its upload ID."""
+    client, bucket = _client_and_bucket()
+    resp = client.create_multipart_upload(
+        Bucket=bucket,
+        Key=_normalize(storage_key),
+        ContentType=content_type or "application/octet-stream",
+    )
+    return str(resp["UploadId"])
+
+
+def presign_part_upload(storage_key: str, upload_id: str, part_number: int, expires_in: int) -> str:
+    """Presigned PUT URL for one part of a multipart upload."""
+    client, bucket = _client_and_bucket()
+    return client.generate_presigned_url(
+        "upload_part",
+        Params={
+            "Bucket": bucket,
+            "Key": _normalize(storage_key),
+            "UploadId": upload_id,
+            "PartNumber": int(part_number),
+        },
+        ExpiresIn=int(expires_in),
+    )
+
+
+def complete_multipart_upload(storage_key: str, upload_id: str, parts: list[dict]) -> dict:
+    """Finish a multipart upload.
+
+    ``parts`` is the ordered list of ``{"PartNumber": n, "ETag": etag}``
+    dicts, as recorded in ``MediaUploadPart``. Returns the S3 response.
+    """
+    client, bucket = _client_and_bucket()
+    return client.complete_multipart_upload(
+        Bucket=bucket,
+        Key=_normalize(storage_key),
+        UploadId=upload_id,
+        MultipartUpload={"Parts": parts},
+    )
+
+
+def abort_multipart_upload(storage_key: str, upload_id: str) -> None:
+    """Abort a multipart upload (unfinished parts stop being billed)."""
+    client, bucket = _client_and_bucket()
+    client.abort_multipart_upload(
+        Bucket=bucket,
+        Key=_normalize(storage_key),
+        UploadId=upload_id,
+    )

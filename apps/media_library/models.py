@@ -290,7 +290,17 @@ class PendingUpload(models.Model):
     an arbitrary or cross-tenant object, and it carries the idempotency state
     (``finalized_at`` + ``media_asset``) that a rowless OAuth caller can't get
     from the REST ``IdempotencyRecord`` path.
+
+    The same row also backs chunked/resumable uploads (``POST
+    /api/v1/media/uploads/``): a chunked session sets ``upload_mode`` to
+    ``"s3_multipart"`` (S3/R2 backend) or ``"server_append"`` (local backend)
+    and records its parts in ``MediaUploadPart``. Legacy presigned-POST rows
+    keep ``upload_mode`` empty — they are not chunked sessions.
     """
+
+    class UploadMode(models.TextChoices):
+        S3_MULTIPART = "s3_multipart", "S3 Multipart"
+        SERVER_APPEND = "server_append", "Server Append"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.ForeignKey(
@@ -326,6 +336,12 @@ class PendingUpload(models.Model):
         blank=True,
         related_name="+",
     )
+    # Chunked-upload session state (v1.2.0). Empty/0 on legacy presigned-POST
+    # rows, which are not chunked sessions.
+    upload_mode = models.CharField(max_length=20, choices=UploadMode.choices, blank=True, default="")
+    total_bytes = models.PositiveBigIntegerField(default=0)
+    chunk_size = models.PositiveBigIntegerField(default=0)
+    s3_upload_id = models.CharField(max_length=255, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -336,3 +352,72 @@ class PendingUpload(models.Model):
 
     def __str__(self):
         return f"PendingUpload {self.id} -> {self.storage_key}"
+
+    @property
+    def is_chunked(self) -> bool:
+        """True for a chunked-upload session (as opposed to a legacy presigned-POST row)."""
+        return self.upload_mode in (self.UploadMode.S3_MULTIPART, self.UploadMode.SERVER_APPEND)
+
+    @property
+    def total_parts(self) -> int:
+        """Number of parts the declared total splits into (0 for non-chunked rows)."""
+        if not self.is_chunked or not self.chunk_size or not self.total_bytes:
+            return 0
+        return -(-int(self.total_bytes) // int(self.chunk_size))
+
+    def received_part_numbers(self) -> list[int]:
+        """Part numbers already recorded for this session, ascending."""
+        return list(self.parts.order_by("part_number").values_list("part_number", flat=True))
+
+    def uploaded_bytes(self) -> int:
+        """Bytes recorded across all received parts."""
+        from django.db.models import Sum
+
+        return int(self.parts.aggregate(total=Sum("size"))["total"] or 0)
+
+    def next_part(self) -> int | None:
+        """First missing part number, or None when every part is present."""
+        received = set(self.received_part_numbers())
+        for number in range(1, self.total_parts + 1):
+            if number not in received:
+                return number
+        return None
+
+    def missing_part_numbers(self) -> list[int]:
+        """Part numbers 1..total_parts with no recorded row, ascending."""
+        received = set(self.received_part_numbers())
+        return [n for n in range(1, self.total_parts + 1) if n not in received]
+
+
+class MediaUploadPart(models.Model):
+    """One received chunk of a chunked upload session.
+
+    The source of truth for resume (which parts arrived) and for S3's
+    ``CompleteMultipartUpload`` (the ordered ``(PartNumber, ETag)`` list).
+    ``etag`` is S3's ETag for ``s3_multipart`` sessions and the hex sha256 of
+    the part bytes for ``server_append`` sessions.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    pending_upload = models.ForeignKey(
+        PendingUpload,
+        on_delete=models.CASCADE,
+        related_name="parts",
+    )
+    part_number = models.PositiveIntegerField()
+    etag = models.CharField(max_length=255)
+    size = models.PositiveBigIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "media_library_upload_part"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["pending_upload", "part_number"],
+                name="unique_part_number_per_upload",
+            ),
+        ]
+        ordering = ["part_number"]
+
+    def __str__(self):
+        return f"MediaUploadPart {self.pending_upload_id} #{self.part_number}"

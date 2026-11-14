@@ -231,16 +231,28 @@ def sweep_pending_uploads():
     the agent never finalizes, the row (and any partially-uploaded object) would
     linger. This reaps anything past its expiry that was never finalized. Object
     deletion is best-effort — the object may never have been uploaded at all.
+
+    Chunked sessions (v1.2.0) are reaped by the same pass: an S3 multipart
+    that is never completed keeps being billed until it is aborted, so the
+    sweep aborts it first; a local session's staging file is deleted too.
+    Part rows go with the session (CASCADE).
     """
     import contextlib
 
     from django.utils import timezone
 
     from .models import PendingUpload
-    from .storage import delete_object
+    from .services import _delete_staging
+    from .storage import abort_multipart_upload, delete_object
 
     stale = PendingUpload.objects.filter(finalized_at__isnull=True, expires_at__lt=timezone.now())
     for pending in stale.iterator():
+        if pending.is_chunked:
+            if pending.upload_mode == PendingUpload.UploadMode.S3_MULTIPART and pending.s3_upload_id:
+                with contextlib.suppress(Exception):
+                    abort_multipart_upload(pending.storage_key, pending.s3_upload_id)
+            elif pending.upload_mode == PendingUpload.UploadMode.SERVER_APPEND:
+                _delete_staging(pending)
         with contextlib.suppress(Exception):
             delete_object(pending.storage_key)
         pending.delete()

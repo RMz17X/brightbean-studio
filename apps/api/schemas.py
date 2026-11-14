@@ -712,6 +712,114 @@ class MediaAssetListResponse(Schema):
 
 
 # ---------------------------------------------------------------------------
+# /media/uploads — chunked/resumable uploads (v1.2.0)
+# ---------------------------------------------------------------------------
+
+
+class UploadSessionRequest(Schema):
+    """``POST /media/uploads/`` — start a chunked upload session."""
+
+    filename: str = Field(..., min_length=1, description="Original filename, e.g. ``clip.mp4``.")
+    total_bytes: int = Field(..., gt=0, description="Declared total size in bytes (must fit the media_type cap).")
+    media_type: str = Field(
+        ...,
+        description="``image`` | ``video`` | ``gif`` | ``document`` — picks the size cap.",
+    )
+    content_type: str | None = Field(
+        None,
+        description="Declared MIME; must be in the allowlist or ``application/octet-stream``.",
+    )
+    alt_text: str = ""
+    title: str = ""
+    tags: list[str] = Field(default_factory=list)
+    folder_id: uuid.UUID | None = None
+    idempotency_key: str | None = Field(
+        None,
+        description=(
+            "Optional client-chosen retry key. Wins over the `Idempotency-Key` "
+            "header when both are sent. Same key + same upload → the current "
+            "session state is replayed; same key + different upload → 422; "
+            "concurrent holder → 409."
+        ),
+    )
+
+
+class UploadSessionResponse(Schema):
+    """A chunked upload session — returned by init, status, and replay."""
+
+    upload_id: uuid.UUID
+    upload_mode: str = Field(..., description="``s3_multipart`` (bytes go straight to storage) or ``server_append`` (bytes PUT to Bean).")
+    filename: str
+    total_bytes: int
+    chunk_size: int = Field(..., description="Bytes per part (server-chosen, 8 MiB).")
+    total_parts: int
+    uploaded_bytes: int
+    received_parts: list[int] = Field(default_factory=list)
+    expires_at: dt.datetime
+    next_part: int | None = Field(None, description="First missing part number, or null when every part arrived.")
+    media_asset_id: uuid.UUID | None = Field(None, description="Set once the session is finalized.")
+
+    @field_serializer("expires_at")
+    def _serialize_expires_at(self, value: dt.datetime | None) -> str | None:
+        return _serialize_utc_z(value)
+
+
+class UploadPartRequest(Schema):
+    """``POST /media/uploads/{upload_id}/parts`` — ask for one part's PUT URL."""
+
+    part_number: int = Field(..., ge=1, description="1-based part number, up to total_parts.")
+
+
+class UploadPartResponse(Schema):
+    """Presigned (S3) or Bean-local (server-append) PUT URL for one part."""
+
+    upload_id: uuid.UUID
+    part_number: int
+    method: str = "PUT"
+    url: str
+    expires_at: dt.datetime
+
+    @field_serializer("expires_at")
+    def _serialize_expires_at(self, value: dt.datetime | None) -> str | None:
+        return _serialize_utc_z(value)
+
+
+class UploadChunkResponse(Schema):
+    """``PUT /media/uploads/{upload_id}/parts/{part_number}`` — one local part stored."""
+
+    upload_id: uuid.UUID
+    part_number: int
+    uploaded_bytes: int
+    next_part: int | None = Field(None, description="Next missing part number, or null when every part arrived.")
+
+
+class UploadSessionAbortResponse(Schema):
+    upload_id: uuid.UUID
+    deleted: bool = True
+
+
+class UploadSessionCompleteRequest(Schema):
+    """``POST /media/uploads/{upload_id}/complete`` — optional asset metadata.
+
+    The metadata supplied at init is validated there (folder existence,
+    media type) but applied here, at finalize time — mirroring the MCP
+    ``finalize_media_upload`` tool, which takes folder/tags at finalize.
+    """
+
+    alt_text: str = ""
+    title: str = ""
+    tags: list[str] = Field(default_factory=list)
+    folder_id: uuid.UUID | None = None
+
+
+class PostDeleteResponse(Schema):
+    """``DELETE /posts/{id}`` — mirrors ``LiveDeleteResponse`` (Agent B)."""
+
+    id: uuid.UUID
+    deleted: bool = True
+
+
+# ---------------------------------------------------------------------------
 # /analytics — read
 # ---------------------------------------------------------------------------
 

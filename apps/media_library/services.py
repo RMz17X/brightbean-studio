@@ -1,9 +1,11 @@
 """Business logic for media library operations."""
 
 import contextlib
+import hashlib
 import io
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import uuid
@@ -16,7 +18,7 @@ from django.db import connection
 from django.db.models import Sum
 from django.utils import timezone
 
-from .models import MediaAsset, MediaAssetVersion, MediaFolder
+from .models import MediaAsset, MediaAssetVersion, MediaFolder, MediaUploadPart, PendingUpload
 from .validators import validate_file
 
 logger = logging.getLogger(__name__)
@@ -173,6 +175,432 @@ def create_pending_upload(
         expires_at=timezone.now() + timedelta(seconds=expires_in),
     )
     return pending, presigned
+
+
+# ---------------------------------------------------------------------------
+# Chunked / resumable uploads (v1.2.0)
+# ---------------------------------------------------------------------------
+#
+# One protocol for the client, two storage adapters chosen at init from
+# ``is_s3_backend()``: S3 Multipart Upload (bytes go straight to R2/S3 via
+# presigned PUT per part) or server-append (bytes PUT to Bean, which writes
+# them at the right offset of a staging file and moves it onto the
+# server-chosen ``storage_key`` at complete time, so the existing finalize
+# path — ``inspect_uploaded_object`` → ``register_uploaded_asset`` — is
+# reused unchanged).
+
+# Bytes per part. >= S3's 5 MiB minimum; 1 GB / 8 MiB = 128 parts, far below
+# the 10,000-part S3 limit; each PUT lasts seconds even on a slow link.
+UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+
+# Chunked sessions live 24h (a 1 GB upload on a 1 MB/s link takes ~17 min;
+# the 900s presigned-POST TTL is too tight). Unfinished sessions are reaped
+# hourly by ``tasks.sweep_pending_uploads``.
+CHUNKED_UPLOAD_TTL_SECONDS = 24 * 60 * 60
+
+
+class ChunkedUploadIncompleteError(Exception):
+    """Raised by ``complete_chunked_upload`` when parts are still missing."""
+
+    def __init__(self, missing):
+        self.missing = list(missing)
+        super().__init__(f"Upload is incomplete; missing parts: {', '.join(str(n) for n in self.missing)}")
+
+
+def chunked_staging_key(pending) -> str:
+    """Storage key of the local staging file a server-append session assembles.
+
+    Lives next to the final key (same directory, ``.part`` suffix) and only
+    ever exists for ``server_append`` sessions. The final ``storage_key``
+    stays absent until complete moves the staging file onto it, so a
+    half-assembled upload can never be mistaken for a finished object.
+    """
+    return f"{pending.storage_key}.part"
+
+
+def _expected_part_size(pending, part_number: int) -> int:
+    """Bytes part ``part_number`` must carry (last part may be short)."""
+    if part_number < pending.total_parts:
+        return int(pending.chunk_size)
+    return int(pending.total_bytes) - int(pending.chunk_size) * (pending.total_parts - 1)
+
+
+def _part_start_offset(pending, part_number: int) -> int:
+    return int(pending.chunk_size) * (part_number - 1)
+
+
+def init_chunked_upload(
+    *,
+    organization,
+    workspace,
+    created_by,
+    declared_filename: str,
+    total_bytes: int,
+    media_type: str,
+    content_type: str = "",
+):
+    """Start a chunked upload session (fail-fast on the per-type size cap).
+
+    Picks the mode from ``is_s3_backend()``: S3 → ``CreateMultipartUpload``
+    now (its ID is stored on the session); local → no object yet, parts
+    arrive at the PUT endpoint and land in the staging file. The session
+    lives 24h; the legacy presigned-POST TTL (900s) is untouched.
+
+    Raises ``ValidationError`` for an unknown ``media_type``, a non-positive
+    ``total_bytes``, a total over the type's cap, or an unsupported
+    ``content_type``. Returns the created ``PendingUpload``.
+    """
+    from .models import PendingUpload
+    from .storage import create_multipart_upload, generate_storage_key, is_s3_backend
+    from .validators import ALL_ALLOWED_MIMES, MAX_FILE_SIZES
+
+    if not declared_filename:
+        raise ValidationError("filename is required.")
+    if media_type not in MAX_FILE_SIZES:
+        raise ValidationError(
+            f"Unknown media_type: {media_type!r}. Expected one of {sorted(MAX_FILE_SIZES)}."
+        )
+    try:
+        total_bytes = int(total_bytes)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("total_bytes must be an integer number of bytes.") from exc
+    if total_bytes <= 0:
+        raise ValidationError("total_bytes must be greater than 0.")
+    cap = int(MAX_FILE_SIZES[media_type])
+    if total_bytes > cap:
+        raise ValidationError(
+            f"File is too large for {media_type}: {total_bytes} bytes exceeds the {cap} byte limit."
+        )
+    if content_type and content_type != "application/octet-stream" and content_type not in ALL_ALLOWED_MIMES:
+        raise ValidationError(f"Unsupported content_type: {content_type!r}.")
+
+    storage_key = generate_storage_key(declared_filename)
+    if is_s3_backend():
+        upload_mode = PendingUpload.UploadMode.S3_MULTIPART
+        s3_upload_id = create_multipart_upload(
+            storage_key, content_type=content_type or "application/octet-stream"
+        )
+    else:
+        upload_mode = PendingUpload.UploadMode.SERVER_APPEND
+        s3_upload_id = ""
+
+    pending = PendingUpload.objects.create(
+        organization=organization,
+        workspace=workspace,
+        created_by=created_by,
+        storage_key=storage_key,
+        declared_content_type=content_type or "",
+        declared_filename=declared_filename,
+        max_bytes=cap,
+        expires_at=timezone.now() + timedelta(seconds=CHUNKED_UPLOAD_TTL_SECONDS),
+        upload_mode=upload_mode,
+        total_bytes=total_bytes,
+        chunk_size=UPLOAD_CHUNK_SIZE,
+        s3_upload_id=s3_upload_id,
+    )
+    return pending
+
+
+def upload_session_state(pending) -> dict:
+    """Current session state, shaped exactly like ``UploadSessionResponse``.
+
+    Computed live from the ``MediaUploadPart`` rows, so an idempotency
+    replay returns the session as it is now (latest received parts), not
+    the stale snapshot stored when init first ran.
+    """
+    return {
+        "upload_id": pending.id,
+        "upload_mode": pending.upload_mode,
+        "filename": pending.declared_filename,
+        "total_bytes": int(pending.total_bytes),
+        "chunk_size": int(pending.chunk_size),
+        "total_parts": pending.total_parts,
+        "uploaded_bytes": pending.uploaded_bytes(),
+        "received_parts": pending.received_part_numbers(),
+        "expires_at": pending.expires_at,
+        "next_part": pending.next_part(),
+        "media_asset_id": pending.media_asset_id,
+    }
+
+
+def _staging_filesystem_path(pending) -> str | None:
+    """Absolute local path of the staging file, or None if the backend has none."""
+    from django.core.files.storage import default_storage
+
+    path = getattr(default_storage, "path", None)
+    if path is None:
+        return None
+    try:
+        return path(chunked_staging_key(pending))
+    except Exception:
+        return None
+
+
+def _staging_size(pending) -> int | None:
+    """Bytes in the staging file, or None if it does not exist yet."""
+    fs_path = _staging_filesystem_path(pending)
+    if fs_path is not None:
+        try:
+            return os.path.getsize(fs_path)
+        except OSError:
+            return None
+    from django.core.files.storage import default_storage
+
+    key = chunked_staging_key(pending)
+    try:
+        if not default_storage.exists(key):
+            return None
+        return int(default_storage.size(key))
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _write_staging_at_offset(pending, offset: int, data: bytes) -> None:
+    """Write ``data`` at ``offset`` in the staging file (creating it if needed)."""
+    fs_path = _staging_filesystem_path(pending)
+    if fs_path is not None:
+        os.makedirs(os.path.dirname(fs_path), exist_ok=True)
+        mode = "r+b" if os.path.exists(fs_path) else "w+b"
+        with open(fs_path, mode) as f:
+            f.seek(offset)
+            f.write(data)
+        return
+    # Backend without a local path (not FileSystemStorage): splice in memory.
+    from django.core.files.storage import default_storage
+
+    key = chunked_staging_key(pending)
+    existing = b""
+    if default_storage.exists(key):
+        with default_storage.open(key, "rb") as f:
+            existing = f.read()
+    buf = bytearray(existing)
+    if len(buf) < offset:
+        buf.extend(b"\x00" * (offset - len(buf)))
+    buf[offset : offset + len(data)] = data
+    default_storage.delete(key)
+    default_storage.save(key, ContentFile(bytes(buf)))
+
+
+def _move_staging_to_key(pending) -> None:
+    """Move the assembled staging file onto the session's ``storage_key``."""
+    fs_path = _staging_filesystem_path(pending)
+    if fs_path is not None:
+        from django.core.files.storage import default_storage
+
+        final_path = default_storage.path(pending.storage_key)
+        os.makedirs(os.path.dirname(final_path), exist_ok=True)
+        os.replace(fs_path, final_path)
+        return
+    from django.core.files.storage import default_storage
+
+    key = chunked_staging_key(pending)
+    with default_storage.open(key, "rb") as f:
+        data = f.read()
+    default_storage.delete(pending.storage_key)
+    default_storage.save(pending.storage_key, ContentFile(data))
+    default_storage.delete(key)
+
+
+def _delete_staging(pending) -> None:
+    """Best-effort removal of the staging file (abort / sweep)."""
+    import contextlib
+
+    from django.core.files.storage import default_storage
+
+    with contextlib.suppress(Exception):
+        default_storage.delete(chunked_staging_key(pending))
+
+
+def store_local_chunk(*, pending, part_number: int, data: bytes, content_range: str | None) -> dict:
+    """Store one part of a ``server_append`` session at its exact offset.
+
+    ``Content-Range: bytes <start>-<end>/<total>`` is mandatory and must
+    agree with the part number, the byte length, and the declared total;
+    anything else is a 422. Re-PUTting a part rewrites the same offset and
+    upserts its row (idempotent). Returns the ``UploadChunkResponse`` shape
+    (``upload_id``, ``part_number``, ``uploaded_bytes``, ``next_part``).
+    """
+    if pending.finalized_at:
+        raise ValidationError("This upload was already finalized.")
+    if pending.expires_at < timezone.now():
+        raise ValidationError("This upload session has expired; start a new one.")
+    if pending.upload_mode != PendingUpload.UploadMode.SERVER_APPEND:
+        raise ValidationError(
+            "This upload session does not accept direct part uploads; "
+            "upload each part to its presigned URL instead."
+        )
+    if part_number < 1 or part_number > pending.total_parts:
+        raise ValidationError(
+            f"part_number must be between 1 and {pending.total_parts}."
+        )
+    if not content_range:
+        raise ValidationError("Content-Range header is required (bytes <start>-<end>/<total>).")
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", (content_range or "").strip())
+    if not match:
+        raise ValidationError("Content-Range header is malformed; expected 'bytes <start>-<end>/<total>'.")
+    start, end, total = (int(g) for g in match.groups())
+    expected_start = _part_start_offset(pending, part_number)
+    expected_size = _expected_part_size(pending, part_number)
+    if total != int(pending.total_bytes):
+        raise ValidationError(
+            f"Content-Range total {total} does not match the declared total_bytes {pending.total_bytes}."
+        )
+    if start != expected_start:
+        raise ValidationError(
+            f"Content-Range start {start} does not match the expected offset {expected_start} "
+            f"for part {part_number}."
+        )
+    if end - start + 1 != len(data) or len(data) != expected_size:
+        raise ValidationError(
+            f"Part {part_number} must carry exactly {expected_size} bytes "
+            f"(got {len(data)})."
+        )
+
+    _write_staging_at_offset(pending, start, data)
+    MediaUploadPart.objects.update_or_create(
+        pending_upload=pending,
+        part_number=part_number,
+        defaults={
+            "etag": hashlib.sha256(data).hexdigest(),
+            "size": len(data),
+        },
+    )
+    return {
+        "upload_id": pending.id,
+        "part_number": part_number,
+        "uploaded_bytes": pending.uploaded_bytes(),
+        "next_part": pending.next_part(),
+    }
+
+
+def complete_chunked_upload(*, pending, uploaded_by, folder=None, alt_text: str = "", title: str = "", tags=None):
+    """Finish a chunked session and register its asset (idempotent replay).
+
+    Verifies every part 1..``total_parts`` is recorded with its expected
+    size, then — S3: ``CompleteMultipartUpload`` with the recorded
+    ``(PartNumber, ETag)`` list; local: checks the assembled staging file
+    is exactly ``total_bytes`` and moves it onto ``storage_key`` — and runs
+    the existing finalize path (``inspect_uploaded_object`` →
+    ``register_uploaded_asset``) unchanged. A replay of an already-finalized
+    session returns the same asset, never a second one.
+
+    Raises ``ChunkedUploadIncompleteError`` (missing parts),
+    ``ValidationError`` (size mismatch / expired / not chunked), or
+    ``StorageQuotaExceededError`` (quota, from ``inspect_uploaded_object``).
+    """
+    from django.db import transaction
+
+    from .models import PendingUpload
+
+    if pending.finalized_at:
+        if pending.media_asset_id is None:
+            raise FileNotFoundError(
+                "This upload was already finalized; its media asset no longer exists."
+            )
+        return pending.media_asset
+
+    if pending.expires_at < timezone.now():
+        raise ValidationError("This upload session has expired; start a new one.")
+    if not pending.is_chunked:
+        raise ValidationError("This upload session is not a chunked upload.")
+
+    missing = pending.missing_part_numbers()
+    if missing:
+        raise ChunkedUploadIncompleteError(missing)
+
+    parts = list(pending.parts.order_by("part_number"))
+    for part in parts:
+        expected = _expected_part_size(pending, part.part_number)
+        if int(part.size) != expected:
+            raise ValidationError(
+                f"Part {part.part_number} has size {part.size}, expected {expected} bytes."
+            )
+    if sum(int(p.size) for p in parts) != int(pending.total_bytes):
+        raise ValidationError(
+            f"Received parts total {sum(int(p.size) for p in parts)} bytes, "
+            f"expected {pending.total_bytes}."
+        )
+
+    if pending.upload_mode == PendingUpload.UploadMode.S3_MULTIPART:
+        if not pending.s3_upload_id:
+            raise ValidationError("This upload session has no S3 multipart upload ID.")
+        from .storage import complete_multipart_upload
+
+        try:
+            complete_multipart_upload(
+                pending.storage_key,
+                pending.s3_upload_id,
+                [{"PartNumber": p.part_number, "ETag": p.etag} for p in parts],
+            )
+        except Exception as exc:
+            raise ValidationError(f"Failed to complete the multipart upload: {exc}") from exc
+    else:
+        assembled = _staging_size(pending)
+        if assembled != int(pending.total_bytes):
+            raise ValidationError(
+                f"Assembled upload is {assembled if assembled is not None else 0} bytes, "
+                f"expected {pending.total_bytes}; the upload is incomplete."
+            )
+        _move_staging_to_key(pending)
+
+    # The shared finalize chokepoint, run OUTSIDE the row lock (see
+    # ``inspect_uploaded_object``): re-derives size/MIME from the stored
+    # object, enforces the allowlist + per-type cap + storage quota, and
+    # deletes the object on failure.
+    inspected = inspect_uploaded_object(pending)
+
+    # Create + mark finalized under a short row lock, re-checking idempotency
+    # so a finalize that won the race while we inspected still wins.
+    with transaction.atomic():
+        locked = PendingUpload.objects.select_for_update().get(pk=pending.pk)
+        if locked.finalized_at and locked.media_asset_id:
+            return locked.media_asset
+        asset = register_uploaded_asset(
+            pending=locked,
+            inspected=inspected,
+            uploaded_by=uploaded_by,
+            folder=folder,
+            alt_text=alt_text or "",
+            title=title or "",
+            tags=list(tags) if tags else [],
+        )
+        locked.finalized_at = timezone.now()
+        locked.media_asset = asset
+        locked.save(update_fields=["finalized_at", "media_asset"])
+    return asset
+
+
+def abort_chunked_upload(pending) -> bool:
+    """Abort an unfinished chunked session and remove all its traces.
+
+    S3: ``AbortMultipartUpload`` (unfinished multiparts keep being billed
+    until aborted) + delete the object; local: delete the staging file +
+    the final key if it somehow exists. Part rows go with the session
+    (CASCADE). Raises ``ValidationError`` for an already-finalized session.
+    """
+    import contextlib
+
+    if pending.finalized_at:
+        raise ValidationError("This upload was already finalized and cannot be aborted.")
+    if not pending.is_chunked:
+        raise ValidationError("This upload session is not a chunked upload.")
+
+    if pending.upload_mode == PendingUpload.UploadMode.S3_MULTIPART and pending.s3_upload_id:
+        from .storage import abort_multipart_upload, delete_object
+
+        with contextlib.suppress(Exception):
+            abort_multipart_upload(pending.storage_key, pending.s3_upload_id)
+        with contextlib.suppress(Exception):
+            delete_object(pending.storage_key)
+    else:
+        from .storage import delete_object
+
+        _delete_staging(pending)
+        with contextlib.suppress(Exception):
+            delete_object(pending.storage_key)
+
+    pending.delete()
+    return True
 
 
 class _HeadProbe:
