@@ -235,8 +235,11 @@ def test_a_grant_that_no_longer_reaches_the_channel_stops_the_inbox(channel):
 
 def test_history_keeps_180_days_and_drops_arbitrary_old_response_payloads(channel):
     now = timezone.now()
+    # 183 days, not 181: the prune cutoff uses the America/Los_Angeles
+    # date, which can lag the UTC date by a day, so at 181 days the
+    # snapshot is only 180 days old in LA terms and survives the prune.
     old = AccountInsightsSnapshot.objects.create(
-        social_account=channel, metric_key="views", date=now.date() - timedelta(days=181), value=4
+        social_account=channel, metric_key="views", date=now.date() - timedelta(days=183), value=4
     )
     retained = AccountInsightsSnapshot.objects.create(
         social_account=channel,
