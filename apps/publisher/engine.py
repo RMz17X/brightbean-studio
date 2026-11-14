@@ -743,6 +743,15 @@ class PublishEngine:
         # provider); the destination is what the options follow. The
         # platform == "zernio" conjunct keeps mocked accounts in existing
         # tests (which set a MagicMock is_via_zernio) from tripping this.
+        # Transport map — routing follows the account, never the
+        # destination: a "zernio" account always lands on ZernioProvider,
+        # including a YouTube destination (supported alongside direct
+        # YouTube OAuth accounts, platform="youtube"). Facebook /
+        # Instagram / TikTok have no live direct route — their direct
+        # providers need app credentials (Meta/TikTok app) and fail
+        # without them — so every connected FB/IG/TT account is a
+        # "zernio" account and comes here; there is no fallback that
+        # could silently re-route one to a direct provider.
         via_zernio = platform == "zernio" and bool(getattr(account, "is_via_zernio", False))
         attachments = list(platform_post.post.media_attachments.select_related("media_asset").order_by("position"))
 

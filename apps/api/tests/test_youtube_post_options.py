@@ -308,7 +308,12 @@ class TestYouTubeOptionsIgnoredElsewhere:
         assert r.status_code == 201, r.content
         # Zernio has no thumbnail / made-for-kids / category field; the
         # thumbnail is NOT validated either (it is dropped, not resolved).
-        assert _platform_extra(r.json()["id"]) == {
-            "privacy_status": "unlisted",
-            "tags": ["bean"],
-        }
+        extra = _platform_extra(r.json()["id"])
+        # YouTube options Zernio cannot carry are dropped; privacy/tags
+        # survive. Transport keys (F12 is_draft/scheduled_for) may also be
+        # present and are not YouTube options.
+        assert extra.get("privacy_status") == "unlisted"
+        assert extra.get("tags") == ["bean"]
+        assert "thumbnail_asset_id" not in extra
+        assert "category_id" not in extra
+        assert "made_for_kids" not in extra

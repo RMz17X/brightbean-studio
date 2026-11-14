@@ -113,8 +113,10 @@ class TestBuildPostPayload:
         return PublishContent(**defaults)
 
     def test_video_payload_matches_local_script(self):
+        # Explicit "public": the bare default is now private (F4), so the
+        # public case has to be asked for, not assumed.
         payload = build_post_payload(
-            content=self._content(),
+            content=self._content(extra={"visibility": "public"}),
             profile_id="prof1",
             destination_platform="youtube",
             account_id="acc-yt",
@@ -173,6 +175,40 @@ class TestBuildPostPayload:
         assert payload["isDraft"] is True
         assert "publishNow" not in payload
 
+    def test_scheduled_for_flag(self):
+        # F12 read side: platform_extra["scheduled_for"] (ISO string) ->
+        # scheduledFor, and no publishNow.
+        payload = build_post_payload(
+            content=self._content(extra={"scheduled_for": "2026-11-15T10:00:00+07:00"}),
+            profile_id="prof1",
+            destination_platform="tiktok",
+            account_id="acc-tt",
+        )
+        assert payload["scheduledFor"] == "2026-11-15T10:00:00+07:00"
+        assert "publishNow" not in payload
+        assert "isDraft" not in payload
+
+    def test_draft_wins_over_scheduled_for(self):
+        payload = build_post_payload(
+            content=self._content(extra={"is_draft": True, "scheduled_for": "2026-11-15T10:00:00+07:00"}),
+            profile_id="prof1",
+            destination_platform="youtube",
+            account_id="acc-yt",
+        )
+        assert payload["isDraft"] is True
+        assert "scheduledFor" not in payload
+        assert "publishNow" not in payload
+
+    def test_is_draft_false_does_not_draft(self):
+        payload = build_post_payload(
+            content=self._content(extra={"is_draft": False}),
+            profile_id="prof1",
+            destination_platform="youtube",
+            account_id="acc-yt",
+        )
+        assert "isDraft" not in payload
+        assert payload["publishNow"] is True
+
 
 class TestPublishPost:
     def _bound_provider(self):
@@ -198,6 +234,20 @@ class TestPublishPost:
         sent = mock_request.call_args.kwargs["json"]
         assert sent["platforms"] == [{"platform": "youtube", "accountId": "acc-yt"}]
         assert sent["publishNow"] is True
+
+    @patch.object(ZernioProvider, "_request")
+    def test_youtube_via_zernio_is_not_blocked(self, mock_request):
+        # Routing follows the account: a Zernio-bound YouTube account
+        # publishes through Zernio, alongside direct YouTube OAuth
+        # accounts — no destination-based refusal exists on this path.
+        mock_request.return_value = _response({"_id": "post-yt-1", "status": "publishing"})
+        result = self._bound_provider().publish_post(
+            None,
+            PublishContent(text="hi", title="Hi", media_urls=["https://example.com/v.mp4"], media_types=["video"]),
+        )
+        assert result.platform_post_id == "post-yt-1"
+        sent = mock_request.call_args.kwargs["json"]
+        assert sent["platforms"] == [{"platform": "youtube", "accountId": "acc-yt"}]
 
     @patch.object(ZernioProvider, "_request")
     def test_publish_uses_access_token_as_key_when_no_credentials(self, mock_request):
@@ -319,10 +369,12 @@ class TestBuildPostPayloadParity:
         payload = self._payload("youtube", visibility="private", privacy_status="public")
         assert payload["visibility"] == "private"
 
-    def test_unknown_visibility_defaults_to_public(self):
-        assert resolve_visibility({"privacy_status": "weird"}) == "public"
-        assert resolve_visibility({}) == "public"
-        assert resolve_visibility(None) == "public"
+    def test_unknown_visibility_defaults_to_private(self):
+        # Fail-closed (F4): an unreadable visibility must never make a
+        # restricted video public — same principle as unlisted -> private.
+        assert resolve_visibility({"privacy_status": "weird"}) == "private"
+        assert resolve_visibility({}) == "private"
+        assert resolve_visibility(None) == "private"
 
     def test_tiktok_panel_maps_to_settings(self):
         payload = self._payload(

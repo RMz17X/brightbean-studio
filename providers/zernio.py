@@ -24,6 +24,20 @@ Flow (mirrors the working ``upload-zernio-curl.sh``):
 4. ``GET /v1/posts/{id}`` to settle the async publish — Zernio reports
    ``scheduled`` → ``publishing`` → ``published``.
 
+Transport map — routing follows the *account*, never the destination
+platform; two methods exist side by side:
+- YouTube: direct (``YouTubeProvider``, OAuth) OR via Zernio, depending
+  on how the account is connected. A YouTube account bound through
+  Zernio publishes through Zernio; nothing in this provider refuses a
+  YouTube destination. A disconnected/erroring Zernio YouTube account is
+  an account-connection problem — fixed by reconnecting it at
+  zernio.com — not a reason to refuse the route.
+- Facebook / Instagram / TikTok: via Zernio only. Their direct
+  providers exist in code but are dormant without a Meta/TikTok app, so
+  every connected FB/IG/TT account is a ``platform="zernio"`` account
+  and always lands on this provider (see
+  ``apps.publisher.engine._dispatch_to_provider``).
+
 Discovery: ``GET /v1/profiles`` (pick the default profile) then
 ``GET /v1/accounts?profileId=<id>`` — the same two calls the local
 ``upload-zernio.py --discover`` makes.
@@ -66,6 +80,10 @@ MAX_ACCOUNTS_PER_KEY = 2
 # end-to-end by the local upload scripts; the rest follow Zernio's own
 # platform list (llms.txt) and are validated by the discovery call, which
 # returns the slug Zernio itself uses for each connected account.
+# "youtube" stays a supported Zernio destination: routing follows the
+# account (see the module docstring), so a Zernio-bound YouTube account
+# publishes here while a direct YouTube account never reaches this
+# provider.
 DESTINATION_PLATFORMS: dict[str, str] = {
     "youtube": "youtube",
     "tiktok": "tiktok",
@@ -143,16 +161,20 @@ def resolve_visibility(extra: dict | None) -> str:
 
     Prefers an explicit ``visibility`` key, else the YouTube
     ``privacy_status`` the composer stores; anything else (including
-    ``unlisted``) falls back as documented above.
+    ``unlisted``) falls back as documented above. Unknown or missing
+    values fail CLOSED to ``"private"``: a video the author meant to
+    restrict must never become public because the transport could not
+    read the setting — the same principle as ``unlisted`` -> ``private``.
     """
-    raw = (extra or {}).get("visibility") or (extra or {}).get("privacy_status") or "public"
+    raw = (extra or {}).get("visibility") or (extra or {}).get("privacy_status") or "private"
     raw = str(raw).strip().lower()
     if raw in ("public", "private"):
         return raw
     if raw == "unlisted":
         logger.info("Zernio has no 'unlisted' visibility; publishing as 'private' instead.")
         return UNLISTED_VISIBILITY_FALLBACK
-    return "public"
+    logger.info("Unknown visibility %r; publishing as 'private' (fail-closed).", raw)
+    return "private"
 
 
 # Zernio post status -> BrightBean publish state.
@@ -242,9 +264,12 @@ def build_post_payload(
     Pure function (no network) so tests can pin the exact payload the
     working local scripts send: ``content``/``title``/``visibility``/
     ``profileId``/``platforms``/``mediaItems`` plus the TikTok settings
-    block for TikTok destinations. The engine only calls publish when the
-    post is due, so this always sets ``publishNow`` unless the post's
-    platform_extra explicitly asks for a draft.
+    block for TikTok destinations. Draft/schedule is the read side of
+    the composer contract — the composer writes ``platform_extra`` (see
+    ``apps.composer.services``): ``is_draft`` (bool) -> ``isDraft``;
+    ``scheduled_for`` (ISO-8601 string) -> ``scheduledFor``. A draft wins
+    when both are set; with neither key present this sets ``publishNow``
+    and sends neither field, so old posts behave exactly as before.
 
     Option mapping (composer panel -> Zernio): YouTube ``privacy_status``
     becomes ``visibility`` via :func:`resolve_visibility` (``unlisted``
@@ -566,7 +591,15 @@ class ZernioProvider(SocialProvider):
         )
 
     def publish_post(self, access_token: str | None = None, content: PublishContent | None = None) -> PublishResult:
-        """``POST /v1/posts`` for the bound destination account."""
+        """``POST /v1/posts`` for the bound destination account.
+
+        YouTube is a supported destination here when the account is
+        Zernio-bound — routing follows the account, and nothing in this
+        method refuses a YouTube destination. A disconnected/erroring
+        Zernio YouTube account fails earlier, at credential/profile
+        lookup, which is an account-connection problem, not a refusal
+        of the route.
+        """
         if content is None:
             raise PublishError("Nothing to publish.", platform=self.platform_name, retryable=False)
         key = self._api_key(access_token)
